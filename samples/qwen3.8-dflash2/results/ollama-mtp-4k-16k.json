@@ -1,0 +1,46 @@
+{
+  "model": "qwen3.8:27b",
+  "runtime": "ollama 0.33.2",
+  "speculative_decoder": {
+    "type": "draft-mtp",
+    "max_draft_tokens": 4
+  },
+  "cells": [
+    {
+      "context_length": 4096,
+      "actual_prompt_tokens": 4102,
+      "output_tokens": 128,
+      "prompt_seconds": 5.963,
+      "prompt_tokens_per_second": 687.86,
+      "decode_seconds": 4.831,
+      "decode_tokens_per_second": 26.50,
+      "total_seconds": 16.358,
+      "load_seconds": 5.558,
+      "draft_acceptance_rate": 0.54430
+    },
+    {
+      "context_length": 8192,
+      "actual_prompt_tokens": 8198,
+      "output_tokens": 128,
+      "prompt_seconds": 12.800,
+      "prompt_tokens_per_second": 640.48,
+      "decode_seconds": 4.558,
+      "decode_tokens_per_second": 28.08,
+      "total_seconds": 17.477,
+      "load_seconds": 0.002,
+      "draft_acceptance_rate": 0.67647
+    },
+    {
+      "context_length": 16384,
+      "actual_prompt_tokens": 16391,
+      "output_tokens": 128,
+      "prompt_seconds": 27.406,
+      "prompt_tokens_per_second": 598.08,
+      "decode_seconds": 5.026,
+      "decode_tokens_per_second": 25.47,
+      "total_seconds": 32.779,
+      "load_seconds": 0.001,
+      "draft_acceptance_rate": 0.60959
+    }
+  ]
+}

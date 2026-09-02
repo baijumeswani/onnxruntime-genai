@@ -1,0 +1,85 @@
+{
+  "cells": [
+    {
+      "arm": "speculative",
+      "batch_size": 1,
+      "completed_full_length": true,
+      "context_length": 4096,
+      "decode_tokens_per_second": 23.536918722623703,
+      "generate_length": 128,
+      "gpu_used_mib": null,
+      "output_tokens": 128,
+      "prompt_tokens": 4093,
+      "speculative": {
+        "acceptance_length_histogram": [10, 9, 2, 4, 3, 4, 2, 3],
+        "acceptance_rate": 0.7317073170731707,
+        "draft_forward_passes": 39,
+        "draft_tokens_accepted": 90,
+        "draft_tokens_evaluated": 123,
+        "draft_tokens_proposed": 258,
+        "output_tokens_per_target_forward": 3.282051282051282,
+        "rounds": 37,
+        "target_forward_passes": 39
+      },
+      "ttft_seconds_max": 5.141998100094497,
+      "ttft_seconds_mean": 5.141998100094497,
+      "wall_seconds": 10.53828790015541
+    },
+    {
+      "arm": "speculative",
+      "batch_size": 1,
+      "completed_full_length": true,
+      "context_length": 8192,
+      "decode_tokens_per_second": 23.294742321544213,
+      "generate_length": 128,
+      "gpu_used_mib": null,
+      "output_tokens": 128,
+      "prompt_tokens": 8173,
+      "speculative": {
+        "acceptance_length_histogram": [6, 8, 5, 7, 3, 4, 1, 2],
+        "acceptance_rate": 0.7338709677419355,
+        "draft_forward_passes": 40,
+        "draft_tokens_accepted": 91,
+        "draft_tokens_evaluated": 124,
+        "draft_tokens_proposed": 243,
+        "output_tokens_per_target_forward": 3.2,
+        "rounds": 36,
+        "target_forward_passes": 40
+      },
+      "ttft_seconds_max": 10.559751700144261,
+      "ttft_seconds_mean": 10.559751700144261,
+      "wall_seconds": 16.01187100005336
+    },
+    {
+      "arm": "speculative",
+      "batch_size": 1,
+      "completed_full_length": true,
+      "context_length": 16384,
+      "decode_tokens_per_second": 22.90449440880406,
+      "generate_length": 128,
+      "gpu_used_mib": null,
+      "output_tokens": 128,
+      "prompt_tokens": 16381,
+      "speculative": {
+        "acceptance_length_histogram": [6, 6, 4, 7, 4, 2, 3, 2],
+        "acceptance_rate": 0.75,
+        "draft_forward_passes": 42,
+        "draft_tokens_accepted": 93,
+        "draft_tokens_evaluated": 124,
+        "draft_tokens_proposed": 237,
+        "output_tokens_per_target_forward": 3.0476190476190474,
+        "rounds": 34,
+        "target_forward_passes": 42
+      },
+      "ttft_seconds_max": 21.749121099943295,
+      "ttft_seconds_mean": 21.749121099943295,
+      "wall_seconds": 27.294120299862698
+    }
+  ],
+  "drafter": "dflash2",
+  "generate_length": 128,
+  "max_batch_size": 1,
+  "max_draft_tokens": 7,
+  "model_dir": "C:\\Users\\Baiju\\workspace\\models\\qwen3.8-27b-nvfp4-int8-kv-dflash2",
+  "num_blocks": 65
+}

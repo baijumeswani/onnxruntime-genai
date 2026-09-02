@@ -1,0 +1,52 @@
+{
+  "cells": [
+    {
+      "arm": "baseline",
+      "batch_size": 1,
+      "completed_full_length": true,
+      "context_length": 4096,
+      "decode_tokens_per_second": 10.164452273960343,
+      "generate_length": 128,
+      "gpu_used_mib": null,
+      "output_tokens": 128,
+      "prompt_tokens": 4093,
+      "ttft_seconds_max": 5.002155299996957,
+      "ttft_seconds_mean": 5.002155299996957,
+      "wall_seconds": 17.496903400169685
+    },
+    {
+      "arm": "baseline",
+      "batch_size": 1,
+      "completed_full_length": true,
+      "context_length": 8192,
+      "decode_tokens_per_second": 10.210429885002474,
+      "generate_length": 128,
+      "gpu_used_mib": null,
+      "output_tokens": 128,
+      "prompt_tokens": 8173,
+      "ttft_seconds_max": 10.275886200135574,
+      "ttft_seconds_mean": 10.275886200135574,
+      "wall_seconds": 22.714367300039157
+    },
+    {
+      "arm": "baseline",
+      "batch_size": 1,
+      "completed_full_length": true,
+      "context_length": 16384,
+      "decode_tokens_per_second": 10.08782780620263,
+      "generate_length": 128,
+      "gpu_used_mib": null,
+      "output_tokens": 128,
+      "prompt_tokens": 16381,
+      "ttft_seconds_max": 21.15356420003809,
+      "ttft_seconds_mean": 21.15356420003809,
+      "wall_seconds": 33.74322970001958
+    }
+  ],
+  "drafter": "dflash2",
+  "generate_length": 128,
+  "max_batch_size": 1,
+  "max_draft_tokens": 7,
+  "model_dir": "C:\\Users\\Baiju\\workspace\\models\\qwen3.8-27b-nvfp4-int8-kv-dflash2",
+  "num_blocks": 65
+}
