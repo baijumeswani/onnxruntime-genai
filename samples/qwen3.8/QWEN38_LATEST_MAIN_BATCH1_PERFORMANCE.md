@@ -1,5 +1,8 @@
 # Qwen 3.8 27B latest-main batch-1 performance on RTX Spark
 
+See [QWEN38_DFLASH2_DRAFTER_DISTILLATION.md](QWEN38_DFLASH2_DRAFTER_DISTILLATION.md)
+for the one-page drafter conclusions and deployment recommendations.
+
 ## Executive summary
 
 The two INT4/INT8-KV DFlash2 packages are the clear decode-throughput leaders.
