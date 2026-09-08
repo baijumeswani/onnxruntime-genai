@@ -15,6 +15,12 @@ is faster than the standard model during decode, but it trails both INT4
 DFlash2 packages. Ollama MTP is competitive at short and medium contexts, then
 drops to 8.11 tok/s at 262K.
 
+On a high-acceptance code-copy workload, the qualified INT4 DFlash2 model
+reaches **78.73 decode tok/s** at 4K with width seven. This demonstrates the
+model/runtime's potential to exceed **60 decode tok/s** when the workload
+provides sufficiently predictable draft tokens; it is an upper-bound result,
+not representative source-analysis throughput.
+
 **Recommendation:** retain
 `qwen3.8-27b-int4-int8-kv-dflash2-tooling-validation2` as the currently
 qualified handoff package. The shifted-tap graph is the correct forward
@@ -153,6 +159,22 @@ Generated tokens per second after the first token. Higher is better.
 
 Geometric-mean decode speedup over standard INT4 is 2.110x for shifted INT4
 DFlash2, 2.080x for original INT4 DFlash2, and 1.610x for NVFP4 DFlash2.
+
+### High-acceptance code-copy ceiling
+
+This prompt asks the model to continue code already present in its context.
+It is useful for measuring the ceiling of speculative decoding, but it is not
+a proxy for typical coding-agent or SWE-bench throughput.
+
+| Model | Context | Draft width | Acceptance | Output/target forward | Decode |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Qualified INT4 DFlash2 | 4,058 | 7 | 97.79% | 7.31 | **78.73 tok/s** |
+| Qualified INT4 DFlash2 | 4,058 | 4 | 99.51% | 5.02 | 48.35 tok/s |
+
+The width-seven result establishes that this stack can exceed **60 decode
+tok/s** on high-acceptance workloads. The representative source-analysis
+qualification remains approximately 20-35 tok/s, with a geometric mean near
+27 tok/s for the INT4 DFlash2 models.
 
 ### Speculative acceptance
 
