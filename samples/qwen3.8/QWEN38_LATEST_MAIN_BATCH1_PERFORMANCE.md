@@ -201,6 +201,53 @@ exceeds the model's 262,144-token total limit. A near-maximum-context run
 would require at most **261,632 input tokens**. That 512-output case has not
 been measured; no throughput is inferred for it.
 
+### Follow-up: natural-EOS SWE-style responses
+
+Three substantive, standalone issue responses reached natural EOS with
+**more than 30 average decode tok/s** on the unchanged eager stack. Unlike
+the preceding repeated eager-control table, these runs used the original
+qualified runtime, **1,032 cache-budget blocks**, and no exact-M overrides,
+experimental persistent buffers, Viterbi selection, or CUDA graph replay.
+The shifted INT4 target/drafter, INT8 target KV, batch size one, seven
+proposals, original greedy selector, and 2,048-token drafter window were
+retained.
+
+| Issue prompt | Input tokens | Output tokens at EOS | TTFT, s | Prompt tok/s | Decode tok/s | Draft acceptance |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Cache-capacity diagnostics | 65,536 | 2,587 | 81.19 | 807.21 | **37.47** | 76.31% |
+| Close during streaming | 98,304 | 2,400 | 141.63 | 694.07 | **39.45** | 80.20% |
+| Stop-string boundaries, offline follow-up | 131,072 | 3,945 | 205.62 | 637.46 | **33.02** | 76.58% |
+
+Each row is one run and returned `FinishReason.EOS`, not a generation-length
+limit. No 128/512-token cap or minimum answer length was imposed; the only
+output safety bound was `262144 - input_tokens - 16`. Decode throughput is
+`(visible_output_tokens - 1) / (last_visible_token_time - first_visible_token_time)`,
+excluding TTFT. Acceptance is the engine's accepted/evaluated proposal rate.
+Each process used 4K/16K warmups with 16 outputs before measurement.
+
+The initial 128K stop-string attempt also reached EOS, but after a **123-token
+tool request**, rather than a standalone issue response: **41.52 decode
+tok/s**, 205.46 s TTFT, 637.94 prompt tok/s, and 81.36% acceptance. That
+attempt is retained in the raw results but is not counted as a sustained
+long-answer result above. One labeled follow-up explicitly stated that no
+tools or tool results were available; it ran in a fresh process with the
+same runtime/settings. No other prompt variants or timing retries were run.
+The model-generated command was not executed.
+
+The 128K long response's **first 128-token window was 22.14 tok/s**, versus
+33.02 tok/s for the complete response. These measurements therefore support
+a workload-qualified average, not a continuous 30 tok/s floor. Different
+issues and continuations have different acceptance rates; the table is not
+a controlled context-scaling comparison or an arbitrary-workload guarantee.
+
+These are constructed SWE-bench-style issues grounded in the frozen local
+source corpus, **not official SWE-bench instances or a correctness score**.
+Generated patches and tests were saved, not applied, compiled, or executed.
+EOS establishes the end of a model turn, not successful issue resolution.
+The local evidence is in `results\swe-eos-20260910\run\results.json` and
+`results\swe-eos-20260910\offline-followup\results.json`, with prompt/response
+files, finish reasons, token IDs, timing windows, and runtime/model hashes.
+
 ### High-acceptance code-copy ceiling
 
 This prompt asks the model to continue code already present in its context.
