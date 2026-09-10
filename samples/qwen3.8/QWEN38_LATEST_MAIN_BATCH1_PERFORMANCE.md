@@ -163,6 +163,44 @@ Generated tokens per second after the first token. Higher is better.
 Geometric-mean decode speedup over standard INT4 is 2.110x for shifted INT4
 DFlash2, 2.080x for original INT4 DFlash2, and 1.610x for NVFP4 DFlash2.
 
+### Follow-up: eager decode with 512 output tokens
+
+The following measurements extend the source-analysis prompts to **512 output
+tokens**, rather than the 128 outputs used above. They use batch size one,
+the shifted INT4 target and INT4 DFlash2 drafter, INT8 target KV cache, seven
+proposals, and the original greedy drafter selector. Neither Viterbi selection
+nor CUDA graph replay is used.
+
+| Input context | Eager decode throughput, 512 outputs |
+| ---: | ---: |
+| 4K - 4,096 tokens | **36.48-37.11 tok/s** |
+| 16K - 16,384 tokens | **43.57-43.72 tok/s** |
+| 64K - 65,536 tokens | **33.29-33.65 tok/s** |
+| 128K - 131,072 tokens | **33.02-33.07 tok/s** |
+| 262K - 262,000 tokens | **Not measured with 512 outputs** |
+
+Ranges cover two repetitions from separate eager-control series, **not one
+uniform sweep**. The 4K/16K rows used the original runtime with lookup disabled;
+the 64K/128K rows used the experimental persistent-buffer runtime with target
+graph replay forced off. Both series used exact-M profiling for M=1..8 and a
+524-block cache pool, preserving full target context and the 2,048-token
+drafter window. The source artifacts are
+`unprofiled-lookup-qualification.json` and `hybrid-long-context-paired.json`
+from the local `results\long-context` qualification directory.
+
+Decode throughput is `511 / (last_token_time - first_token_time)` and excludes
+TTFT. These results establish **more than 30 average decode tok/s on the
+measured 512-output workloads through 128K**, not a continuous 30 tok/s floor.
+The first 128-token window at 128K remained approximately 24 tok/s in these
+eager runs; later, more predictable tokens increased draft acceptance and
+raised the full-request decode average. This does not establish the same
+rate for arbitrary workloads or every output length greater than 512.
+
+The 262K row requires a shorter prompt: 262,000 input plus 512 output tokens
+exceeds the model's 262,144-token total limit. A near-maximum-context run
+would require at most **261,632 input tokens**. That 512-output case has not
+been measured; no throughput is inferred for it.
+
 ### High-acceptance code-copy ceiling
 
 This prompt asks the model to continue code already present in its context.
