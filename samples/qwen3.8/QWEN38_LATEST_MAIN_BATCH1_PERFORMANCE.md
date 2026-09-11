@@ -248,6 +248,48 @@ The local evidence is in `results\swe-eos-20260910\run\results.json` and
 `results\swe-eos-20260910\offline-followup\results.json`, with prompt/response
 files, finish reasons, token IDs, timing windows, and runtime/model hashes.
 
+### Follow-up: ORT GenAI versus llama.cpp DFlash2 to EOS
+
+Both frameworks completed identical frozen, token-for-token input sequences
+at batch one, using real DFlash2 with seven proposals and greedy target
+sampling. These are **fresh ORT runs**, not the preceding natural-EOS rows
+reused as a reference. Each framework ran alone on the GPU.
+
+| Input tokens | Framework | Output tokens at EOS | TTFT, s | Prompt tok/s | Decode tok/s |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 65,536 | ORT GenAI | 2,979 | 81.489 | 804.23 | **36.96** |
+| 65,536 | llama.cpp | 3,294 | 115.370 | 568.05 | 23.44 |
+| 98,304 | ORT GenAI | 2,448 | 140.189 | 701.22 | **38.35** |
+| 98,304 | llama.cpp | 2,228 | 191.367 | 513.69 | 17.09 |
+| 131,072 | ORT GenAI | 5,963 | 205.276 | 638.52 | **34.60** |
+| 131,072 | llama.cpp | 3,667 | 277.828 | 471.77 | 14.93 |
+
+ORT's average decode throughput was **1.58x, 2.24x, and 2.32x** llama.cpp's
+at 64K, 96K, and 128K, respectively. All six turns reached natural EOS;
+there was no 128/512-output-token cap. Prompt throughput is input tokens
+divided by TTFT. Decode throughput uses the same visible-token formula as
+the preceding table; terminal EOS tokens are excluded.
+
+ORT used the unchanged qualified eager INT4 block-32 / INT8-KV shifted-tap
+DFlash2 stack, original greedy selector, and 1,032-block-equivalent budget.
+llama.cpp used official Windows ARM64 CUDA 13.4 release **b10902**
+(`df03399b8`), the existing Qwen3.8 27B 0814 Q4_K_M target GGUF, the supplied
+z-lab DFlash2 Q4_K_M drafter, Q8_0 target KV, and BF16 draft KV. Both used
+a 2,048-token drafter window. llama explicitly selected `draft-dflash`,
+not MTP; all prompts were fully processed with zero cached prompt tokens.
+
+**This is a deployed-stack comparison, not a pure framework-only speedup.**
+Target/drafter quantization and cache formats differ; byte-identical source
+checkpoints across target exports have not been established. Response
+lengths and speculative acceptance also differ. Each row is one run, not
+a repeated average, and generated changes were not applied or scored.
+
+See [the complete framework comparison](QWEN38_FRAMEWORK_DFLASH2_COMPARISON.md)
+for runtime/model hashes, native timing counters, exact measurement policy,
+and reproduction details. Its acceptance table uses **accepted/proposed**
+for both stacks; earlier ORT **accepted/evaluated** percentages are not
+directly comparable with llama's accepted/proposed percentages.
+
 ### High-acceptance code-copy ceiling
 
 This prompt asks the model to continue code already present in its context.
