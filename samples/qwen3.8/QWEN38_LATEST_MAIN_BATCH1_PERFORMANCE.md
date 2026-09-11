@@ -290,6 +290,48 @@ and reproduction details. Its acceptance table uses **accepted/proposed**
 for both stacks; earlier ORT **accepted/evaluated** percentages are not
 directly comparable with llama's accepted/proposed percentages.
 
+### Follow-up: ORT DFlash2 versus Unsloth llama.cpp MTP
+
+The requested **`unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf`**
+contains the trained native MTP head and ran with **`--spec-type draft-mtp`**
+in official llama.cpp **b10902**. No separate DFlash drafter was loaded by
+llama.cpp in this comparison. ORT retained its unchanged qualified eager
+INT4 / INT8-KV DFlash2 stack and was rerun for a fresh reference.
+
+| Input tokens | Stack | Output tokens at EOS | TTFT, s | Prompt tok/s | Decode tok/s |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 65,536 | ORT GenAI + DFlash2 | 3,214 | 82.338 | 795.94 | **37.30** |
+| 65,536 | llama.cpp + MTP | 5,561 | 114.259 | 573.58 | 21.82 |
+| 98,304 | ORT GenAI + DFlash2 | 2,712 | 135.128 | 727.49 | **35.15** |
+| 98,304 | llama.cpp + MTP | 3,552 | 190.571 | 515.84 | 18.24 |
+| 131,072 | ORT GenAI + DFlash2 | 4,921 | 198.199 | 661.31 | **35.71** |
+| 131,072 | llama.cpp + MTP | 4,024 | 273.114 | 479.92 | 13.43 |
+
+ORT DFlash2 delivered **1.71x, 1.93x, and 2.66x** the average decode
+throughput of this llama.cpp MTP configuration at 64K, 96K, and 128K.
+All six requests used identical frozen input token sequences, batch one,
+greedy target sampling, and natural EOS. No 128/512-token response cap or
+minimum answer length was imposed. The frameworks ran serially on the GPU.
+Prompt throughput is input tokens divided by TTFT; decode throughput uses
+the first-to-last-visible-token interval and excludes the terminal EOS.
+
+llama MTP used its default maximum of **three proposals**, Q8_0 target KV,
+and BF16 MTP KV. ORT used **seven DFlash2 proposals**, INT8 target KV, a
+BF16 2,048-token drafter window, and 1,032 cache-budget blocks. MTP uses a
+single trained head with full-context attention, not the DFlash2 window.
+Three MTP proposals is a disclosed default, not a tuned optimal depth.
+
+**This compares the two configured stacks, not isolated frameworks or
+speculation algorithms.** Unsloth UD-Q4_K_XL uses mixed-precision weights;
+it is not identical to ORT INT4 block-32 or the preceding llama Q4_K_M
+target. Draft methods, depths, caches, response lengths, and acceptance
+differ. Each row is one run, and no generated changes were executed or
+scored.
+
+See [the full ORT DFlash2 versus llama MTP report](QWEN38_ORT_DFLASH2_VS_LLAMA_MTP_COMPARISON.md)
+for the pinned model revision/checksum, MTP tensor inventory, native timing
+and acceptance counters, measurement definitions, and reproduction commands.
+
 ### High-acceptance code-copy ceiling
 
 This prompt asks the model to continue code already present in its context.
