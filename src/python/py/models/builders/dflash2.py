@@ -57,6 +57,7 @@ class DFlash2Builder(BlockDrafterBuilder):
         filename="dflash2.onnx",
         num_draft_tokens=None,
         quant=None,
+        quantize_all_constant=False,
     ):
         self.draft_dir = draft_dir
         self.target_dir = target_dir
@@ -70,7 +71,9 @@ class DFlash2Builder(BlockDrafterBuilder):
             self.quant_bits = quant["bits"]
             self.quant_block_size = quant["block_size"]
             self.quant_prepack = quant["prepack"]
+            self.quant_accuracy_level = quant.get("accuracy_level", 0)
             self.lm_head_quant = quant["lm_head"]
+        self.quantize_all_constant = quantize_all_constant
         self.filename = filename
         self.paged_block_size = paged_block_size
 
@@ -165,7 +168,7 @@ class DFlash2Builder(BlockDrafterBuilder):
             self.hidden_size,
             2 * self.taps * self.num_groups,
             rows,
-            quantize=False,
+            quantize=self.quantize_all_constant,
         )
         flat = self.reshape(
             f"{prefix}/kernel_projection/Reshape",
@@ -592,7 +595,7 @@ class DFlash2Builder(BlockDrafterBuilder):
             self.hidden_size,
             rank,
             "num_sample",
-            quantize=False,
+            quantize=self.quantize_all_constant,
         )
         hp3 = self.reshape(
             "/dflash2/selector/hp", hp, [-1, n_spec, 1, rank], self.io_dtype, ["batch_size", n_spec, 1, rank]

@@ -394,6 +394,7 @@ class Model:
         self.mlp_attrs = {
             "use_proj": True,                                # Use projection style for MLP (GateProj/UpProj/DownProj)
             "use_fc": False,                                 # Use fully-connected style for MLP (FC1/FC2)
+            "fuse_gate_up": False,                            # Fuse compatible gate/up projections before quantization
             "output_0": "",                                  # Output 0 for MLP subgraph
         }
 
@@ -2338,6 +2339,29 @@ class Model:
         else:
             # For regular `MatMul`
             return self.make_matmul_op(matmul, basename, root_input, **kwargs)
+
+    def make_mlp_gate_up_matmul(self, gate, up, basename, root_input):
+        weight_name = basename[1:].replace("/", ".") + ".weight"
+        torch_dtype = to_torch_dtype(self.io_dtype)
+
+        def tensor_func():
+            weight = torch.cat((gate.weight.detach(), up.weight.detach()), dim=0)
+            return TorchTensor(weight.T.to(torch_dtype).contiguous(), name=weight_name)
+
+        shape = ir.Shape([gate.in_features, gate.out_features + up.out_features])
+        tensor = ir.LazyTensor(tensor_func, dtype=self.io_dtype, shape=shape, name=weight_name)
+        value = self.make_value(weight_name, tensor.dtype, tensor.shape)
+        value.const_value = tensor
+        self.model.graph.register_initializer(value)
+
+        output = f"{basename}/output_0"
+        self.make_node("MatMul", inputs=[root_input, weight_name], outputs=[output], name=basename)
+        self.make_value(
+            output,
+            self.io_dtype,
+            shape=self.make_hidden_state_shape(last_dim=gate.out_features + up.out_features),
+        )
+        return basename
 
     def make_matmul_quantized(self, matmul, basename, root_input, **kwargs):
         if matmul.quant_type == "nvfp4":
@@ -4842,6 +4866,94 @@ class Model:
         #           DownProjAdd
 
         basename = f"/model/layers.{layer_id}/mlp"
+
+        if self.mlp_attrs["fuse_gate_up"]:
+            gate = mlp.gate_proj
+            up = mlp.up_proj
+            unsupported = [
+                name
+                for name, projection in (("gate", gate), ("up", up))
+                if hasattr(projection, "base_layer")
+                or getattr(projection, "quant_type", "none") != "none"
+                or hasattr(projection, "qweight")
+            ]
+            if unsupported:
+                raise ValueError(
+                    f"fuse_mlp_gate_up does not support LoRA or pre-quantized {'/'.join(unsupported)} projections."
+                )
+            if gate.in_features != up.in_features or gate.out_features != up.out_features:
+                raise ValueError("fuse_mlp_gate_up requires matching gate and up projection dimensions.")
+            if (gate.bias is None) != (up.bias is None):
+                raise ValueError("fuse_mlp_gate_up requires matching gate and up bias layouts.")
+            if getattr(gate, "exclude_from_quantization", False) != getattr(up, "exclude_from_quantization", False):
+                raise ValueError("fuse_mlp_gate_up requires matching gate and up quantization placement.")
+
+            gate_basename = f"{basename}/gate_proj/MatMul"
+            up_basename = f"{basename}/up_proj/MatMul"
+            fused_basename = f"{basename}/gate_up_proj/MatMul"
+            gate_excluded = gate_basename in self.quant_attrs["nodes_to_exclude"]
+            up_excluded = up_basename in self.quant_attrs["nodes_to_exclude"]
+            if gate_excluded != up_excluded:
+                raise ValueError("fuse_mlp_gate_up requires matching gate and up quantization placement.")
+            if gate_excluded:
+                self.quant_attrs["nodes_to_exclude"].remove(gate_basename)
+                self.quant_attrs["nodes_to_exclude"].remove(up_basename)
+                self.exclude_node_from_quantization(fused_basename)
+
+            gate_config = self.int4_customized_weight_config.pop(gate_basename, None)
+            up_config = self.int4_customized_weight_config.pop(up_basename, None)
+            if gate_config != up_config:
+                raise ValueError("fuse_mlp_gate_up requires matching gate and up mixed-precision placement.")
+            if gate_config is not None:
+                self.int4_customized_weight_config[fused_basename] = gate_config
+
+            if getattr(gate, "exclude_from_quantization", False):
+                self.exclude_node_from_quantization(fused_basename)
+            fused_name = self.make_mlp_gate_up_matmul(gate, up, fused_basename, root_input)
+            fused_output = f"{fused_name}/output_0"
+            if gate.bias is not None:
+                fused_bias = torch.cat((gate.bias.detach(), up.bias.detach()), dim=0)
+            else:
+                fused_bias = None
+            if fused_bias is not None and torch.count_nonzero(fused_bias) > 0:
+                fused_add_name = f"{basename}/gate_up_proj/Add"
+                self.make_add_bias(fused_bias, fused_add_name, root_input=fused_output)
+                fused_output = f"{fused_add_name}/output_0"
+
+            split_name = f"{basename}/gate_up_proj/Split"
+            gate_output = f"{split_name}/output_0"
+            up_output = f"{split_name}/output_1"
+            self.make_node(
+                "Split",
+                inputs=[
+                    fused_output,
+                    f"/model/constants/INT64/{[self.intermediate_size, self.intermediate_size]}",
+                ],
+                outputs=[gate_output, up_output],
+                name=split_name,
+                axis=-1,
+            )
+            split_shape = self.make_hidden_state_shape(last_dim=self.intermediate_size)
+            self.make_value(gate_output, self.io_dtype, shape=split_shape)
+            self.make_value(up_output, self.io_dtype, shape=split_shape)
+
+            act_fn_name = self.make_activation(layer_id, root_input=gate_output)
+            mul_name = f"{basename}/Mul"
+            self.make_mul(
+                mul_name,
+                [f"{act_fn_name}/output_0", up_output],
+                dtype=self.io_dtype,
+                shape=split_shape,
+            )
+            down_matmul_basename = f"{basename}/down_proj/MatMul"
+            down_matmul_name = self.make_matmul(mlp.down_proj, down_matmul_basename, f"{mul_name}/output_0")
+            down_name = down_matmul_name
+            if mlp.down_proj.bias is not None and torch.count_nonzero(mlp.down_proj.bias) > 0:
+                down_add_name = f"{basename}/down_proj/Add"
+                self.make_add_bias(mlp.down_proj.bias, down_add_name, root_input=f"{down_name}/output_0")
+                down_name = down_add_name
+            self.mlp_attrs["output_0"] = f"{down_name}/output_0"
+            return
 
         # Check if Add nodes need to be made (if bias exists)
         gate_bias_exists = mlp.gate_proj.bias is not None and torch.count_nonzero(mlp.gate_proj.bias) > 0

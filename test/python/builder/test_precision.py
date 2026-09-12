@@ -16,6 +16,7 @@ import types
 from pathlib import Path
 
 import numpy as np
+import onnx
 import onnx_ir as ir
 import onnxruntime as ort
 import pytest
@@ -213,6 +214,117 @@ def _load_builder_entrypoint_module():
 base_module = _load_base_module()
 builder_module = _load_builder_entrypoint_module()
 Model = base_module.Model
+
+
+def test_fused_mlp_preserves_gate_then_up_weight_order():
+    torch = base_module.torch
+    model = Model.__new__(Model)
+    model.io_dtype = ir.DataType.FLOAT16
+    model.hidden_size = 3
+    model.intermediate_size = 2
+    model.mlp_attrs = {"fuse_gate_up": True, "output_0": ""}
+    model.quant_attrs = {"nodes_to_exclude": []}
+    model.int4_customized_weight_config = {}
+    captured = {}
+    nodes = []
+
+    def make_matmul(projection, basename, root_input):
+        captured[basename] = projection.weight.detach().clone()
+        return basename
+
+    model.make_matmul = make_matmul
+    model.make_mlp_gate_up_matmul = lambda gate, up, basename, root_input: (
+        captured.__setitem__(basename, torch.cat((gate.weight.detach(), up.weight.detach()), dim=0)) or basename
+    )
+    model.make_activation = lambda layer_id, root_input: f"/model/layers.{layer_id}/mlp/act"
+    model.make_mul = lambda *_args, **_kwargs: None
+    model.make_add_bias = lambda *_args, **_kwargs: None
+    model.make_hidden_state_shape = lambda last_dim=None, **_kwargs: ["batch", "sequence", last_dim]
+    model.make_value = lambda *_args, **_kwargs: None
+    model.make_node = lambda op_type, inputs, outputs, name, **attrs: nodes.append(
+        (op_type, inputs, outputs, name, attrs)
+    )
+
+    gate = torch.nn.Linear(3, 2, bias=False)
+    up = torch.nn.Linear(3, 2, bias=False)
+    down = torch.nn.Linear(2, 3, bias=False)
+    gate.weight.data.copy_(torch.tensor([[1, 2, 3], [4, 5, 6]]))
+    up.weight.data.copy_(torch.tensor([[7, 8, 9], [10, 11, 12]]))
+    mlp = types.SimpleNamespace(gate_proj=gate, up_proj=up, down_proj=down)
+
+    model.make_mlp_proj(0, mlp, "hidden_states")
+
+    fused = captured["/model/layers.0/mlp/gate_up_proj/MatMul"]
+    assert torch.equal(fused[:2], gate.weight)
+    assert torch.equal(fused[2:], up.weight)
+    split = next(node for node in nodes if node[0] == "Split")
+    assert split[1][1] == "/model/constants/INT64/[2, 2]"
+    assert "split" not in split[4]
+    assert model.mlp_attrs["output_0"] == "/model/layers.0/mlp/down_proj/MatMul/output_0"
+
+    split_node = onnx.helper.make_node(
+        split[0],
+        ["fused", "split_sizes"],
+        ["gate", "up"],
+        name=split[3],
+        **split[4],
+    )
+    graph = onnx.helper.make_graph(
+        [split_node],
+        "fused_mlp_split",
+        [onnx.helper.make_tensor_value_info("fused", onnx.TensorProto.FLOAT, [1, 4])],
+        [
+            onnx.helper.make_tensor_value_info("gate", onnx.TensorProto.FLOAT, [1, 2]),
+            onnx.helper.make_tensor_value_info("up", onnx.TensorProto.FLOAT, [1, 2]),
+        ],
+        initializer=[onnx.helper.make_tensor("split_sizes", onnx.TensorProto.INT64, [2], [2, 2])],
+    )
+    onnx.checker.check_model(
+        onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 22)]),
+        full_check=True,
+    )
+
+
+def test_fused_mlp_rejects_mixed_quantization_placement():
+    torch = base_module.torch
+    model = Model.__new__(Model)
+    model.io_dtype = ir.DataType.FLOAT16
+    model.hidden_size = 3
+    model.intermediate_size = 2
+    model.mlp_attrs = {"fuse_gate_up": True, "output_0": ""}
+    model.quant_attrs = {"nodes_to_exclude": ["/model/layers.0/mlp/gate_proj/MatMul"]}
+    model.int4_customized_weight_config = {}
+    mlp = types.SimpleNamespace(
+        gate_proj=torch.nn.Linear(3, 2, bias=False),
+        up_proj=torch.nn.Linear(3, 2, bias=False),
+        down_proj=torch.nn.Linear(2, 3, bias=False),
+    )
+
+    with pytest.raises(ValueError, match="matching gate and up quantization placement"):
+        model.make_mlp_proj(0, mlp, "hidden_states")
+
+
+def test_fused_mlp_weight_is_materialized_lazily_in_gate_up_order():
+    torch = base_module.torch
+    model = Model.__new__(Model)
+    model.io_dtype = ir.DataType.FLOAT16
+    model.values = {}
+    model.node_names = set()
+    model.model = ir.Model(
+        ir.Graph(inputs=(), outputs=(), nodes=(), opset_imports={"": 22}, name="test"),
+        ir_version=10,
+    )
+    model.make_hidden_state_shape = lambda last_dim=None, **_kwargs: ["batch", "sequence", last_dim]
+    gate = torch.nn.Linear(3, 2, bias=False)
+    up = torch.nn.Linear(3, 2, bias=False)
+    gate.weight.data.copy_(torch.tensor([[1, 2, 3], [4, 5, 6]]))
+    up.weight.data.copy_(torch.tensor([[7, 8, 9], [10, 11, 12]]))
+
+    model.make_mlp_gate_up_matmul(gate, up, "/model/layers.0/mlp/gate_up_proj/MatMul", "hidden_states")
+
+    tensor = model.model.graph.initializers["model.layers.0.mlp.gate_up_proj.MatMul.weight"].const_value
+    expected = torch.cat((gate.weight.detach(), up.weight.detach()), dim=0).T.numpy()
+    np.testing.assert_array_equal(tensor.numpy(), expected)
 
 
 def test_add_special_token_ids_uses_first_available_candidate():

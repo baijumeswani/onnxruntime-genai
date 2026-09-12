@@ -327,8 +327,16 @@ Set `dflash2_path` to a DFlash 2 checkpoint to export an auxiliary `dflash2.onnx
 
 `dflash2_precision` accepts `bf16` (default), `int4`, or `int8`. Integer modes quantize the attention and MLP weights at the target's block size while keeping the small dynamic-convolution and selector projections dense. Body activations and KV caches remain BF16; this option does not quantize the drafter's KV cache. The body uses plain blockwise weights because CUDA fpA-intB prepacking requires FP16 activations. The LM head follows the target's symmetric DEFAULT integer quantization, including mixed-precision bit overrides, and uses prepacking only when its dtype and dimensions are eligible. Other target head formats remain dense in the drafter. Shared initializers are deduplicated only when their bytes match.
 
+Set `dflash2_quantize_all_constant=true` with `dflash2_precision=int4` or `int8` to quantize every eligible constant-weight projection, including the dynamic-convolution kernel projections and selector hidden projection. The selector pair projection remains a regular `MatMul` because its right-hand input is generated dynamically.
+
+Set `fuse_mlp_gate_up=true` to fuse compatible dense Qwen gate and up projections before quantization and split the combined output before the activation. The option rejects LoRA, pre-quantized modules, incompatible dimensions or bias layouts, and differing quantization placement.
+
+Set `quantize_linear_attention_gates=true` to include Qwen linear-attention `a_proj` and `b_proj` weights in weight-only quantization. They remain dense by default because their recurrence-sensitive outputs can affect long-context quality.
+
+Set `dflash2_require_target_embedding_and_lm_head=true` to require the drafter to use the target's exact dense embedding and quantized LM-head external-data ranges. This requires integer DFlash precision, a compatible target embedding, and the target's symmetric default `MatMulNBits` head layout. The build fails instead of retaining duplicate weights when exact binding is unavailable.
+
 ```bash
-python -m onnxruntime_genai.models.builder -i path_to_target_model -o path_to_output_folder -p int4 -e cuda --extra_options use_paged_attention=true aux_hidden_state_layers=2,12,22 dflash2_path=path_to_dflash2_checkpoint dflash2_precision=int4
+python -m onnxruntime_genai.models.builder -i path_to_target_model -o path_to_output_folder -p int4 -e cuda --extra_options use_paged_attention=true aux_hidden_state_layers=2,12,22 dflash2_path=path_to_dflash2_checkpoint dflash2_precision=int4 fuse_mlp_gate_up=true quantize_linear_attention_gates=true dflash2_quantize_all_constant=true dflash2_require_target_embedding_and_lm_head=true
 ```
 
 ```bash

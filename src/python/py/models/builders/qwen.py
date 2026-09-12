@@ -123,6 +123,9 @@ class Qwen35TextModel(Model):
 
     def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
         super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
+        self.mlp_attrs = getattr(self, "mlp_attrs", {})
+        self.mlp_attrs["fuse_gate_up"] = bool(extra_options.get("fuse_mlp_gate_up", False))
+        self.quantize_linear_attention_gates = bool(extra_options.get("quantize_linear_attention_gates", False))
 
         self.linear_attn_op = str(extra_options.get("linear_attn_op", "linear_attention")).lower()
         if self.linear_attn_op not in ("linear_attention", "gated_delta_net"):
@@ -542,16 +545,20 @@ class Qwen35TextModel(Model):
         z_name = f"{basename}/z_proj/MatMul"
         self.make_matmul(attention.in_proj_z, z_name, root_input)
 
-        # The decay and beta gates drive the GatedDeltaNet recurrence, and their weights are
-        # ~0.1% of the model, so they stay dense regardless of which loader supplied them.
         b_name = f"{basename}/b_proj/MatMul"
         self.require_dense_linear_attention_gate(attention.in_proj_b, b_name)
-        self.exclude_node_from_quantization(b_name)
+        if self.quantize_linear_attention_gates:
+            attention.in_proj_b.exclude_from_quantization = False
+        else:
+            self.exclude_node_from_quantization(b_name)
         self.make_matmul(attention.in_proj_b, b_name, root_input)
 
         a_name = f"{basename}/a_proj/MatMul"
         self.require_dense_linear_attention_gate(attention.in_proj_a, a_name)
-        self.exclude_node_from_quantization(a_name)
+        if self.quantize_linear_attention_gates:
+            attention.in_proj_a.exclude_from_quantization = False
+        else:
+            self.exclude_node_from_quantization(a_name)
         self.make_matmul(attention.in_proj_a, a_name, root_input)
 
         conv_input = f"{qkv_name}/output_0"
@@ -989,6 +996,8 @@ class Qwen35MoEModel(MTPModel):
         # A block drafter reads the target's aux hidden states, so it is never nested in the head.
         mtp_options.pop("dflash2_path", None)
         mtp_options.pop("dflash2_num_draft_tokens", None)
+        mtp_options.pop("fuse_mlp_gate_up", None)
+        mtp_options.pop("quantize_linear_attention_gates", None)
         mtp_options.pop("dspark_path", None)
         mtp_options.pop("dspark_num_draft_tokens", None)
         mtp_options.pop("dspark_top_k", None)
@@ -1140,7 +1149,14 @@ class Qwen35MoEModel(MTPModel):
         bits = 4 if precision == "int4" else 8
         block_size = int(self.decoder.quant_attrs["matmul_block_size"])
         prepack = int(self.decoder.matmul_attrs["weights_prepacked"])
-        quant = {"bits": bits, "block_size": block_size, "prepack": prepack, "lm_head": None}
+        accuracy_level = int(self.decoder.quant_attrs.get("accuracy_level", 0))
+        quant = {
+            "bits": bits,
+            "block_size": block_size,
+            "prepack": prepack,
+            "accuracy_level": accuracy_level,
+            "lm_head": None,
+        }
 
         if self.decoder.exclude_lm_head or not self.decoder.is_lm_head_quantized():
             return quant
@@ -1186,7 +1202,18 @@ class Qwen35MoEModel(MTPModel):
             "io_dtype": io_dtype,
             "num_draft_tokens": num_draft_tokens,
             "precision": self.block_drafter_precision(extra_options, "dflash2_precision"),
+            "quantize_all_constant": bool(extra_options.get("dflash2_quantize_all_constant", False)),
+            "require_target_embedding_and_lm_head": bool(
+                extra_options.get("dflash2_require_target_embedding_and_lm_head", False)
+            ),
         }
+        if self.dflash2_attrs["quantize_all_constant"] and self.dflash2_attrs["precision"] == "bf16":
+            raise ValueError("dflash2_quantize_all_constant=true requires dflash2_precision=int4 or int8.")
+        if self.dflash2_attrs["require_target_embedding_and_lm_head"]:
+            if self.dflash2_attrs["precision"] == "bf16":
+                raise ValueError(
+                    "dflash2_require_target_embedding_and_lm_head=true requires dflash2_precision=int4 or int8."
+                )
 
         with open(os.path.join(self.dflash2_path, "config.json"), encoding="utf-8") as handle:
             draft_config = json.load(handle)
@@ -1206,6 +1233,14 @@ class Qwen35MoEModel(MTPModel):
 
         print("Building DFlash 2 draft model -> dflash2.onnx")
         target_dir = input_path if input_path and os.path.isdir(input_path) else self.decoder.model_name_or_path
+        quant = self.block_drafter_quant(self.dflash2_attrs["precision"])
+        if self.dflash2_attrs.get("require_target_embedding_and_lm_head", False) and (
+            quant is None or quant["lm_head"] is None
+        ):
+            raise ValueError(
+                "dflash2_require_target_embedding_and_lm_head=true requires a tied target LM head "
+                "using the symmetric default MatMulNBits layout."
+            )
         self.dflash2 = DFlash2Builder(
             self.dflash2_path,
             target_dir,
@@ -1213,18 +1248,95 @@ class Qwen35MoEModel(MTPModel):
             self.decoder.attention_attrs["paged_block_size"],
             self.decoder.context_length,
             num_draft_tokens=self.dflash2_attrs["num_draft_tokens"],
-            quant=self.block_drafter_quant(self.dflash2_attrs["precision"]),
+            quant=quant,
+            quantize_all_constant=self.dflash2_attrs.get("quantize_all_constant", False),
         )
         self.dflash2.make_model()
+        if self.dflash2_attrs.get("quantize_all_constant", False) and self.dflash2.unquantized_constant_matmuls:
+            names = ", ".join(sorted(self.dflash2.unquantized_constant_matmuls))
+            raise ValueError(f"DFlash 2 full constant-weight quantization left dense MatMuls: {names}.")
 
     def save_dflash2_model(self, output_dir):
         if self.dflash2 is None:
             return
         self.dflash2.save_model(output_dir)
+        required = self.dflash2_attrs.get("require_target_embedding_and_lm_head", False)
+        authoritative_names = ()
+        if required:
+            bits = self.dflash2.lm_head_quant["bits"]
+            authoritative_names = (
+                "model.embed_tokens.weight",
+                f"lm_head.MatMul.weight_Q{bits}",
+                "lm_head.MatMul.weight_scales",
+            )
+            self.require_dflash2_consumer_layout(output_dir, authoritative_names)
         self.dflash2_shared_initializers = self.share_initializers(
-            output_dir, self.decoder.filename, self.dflash2.filename
+            output_dir,
+            self.decoder.filename,
+            self.dflash2.filename,
+            authoritative_names=authoritative_names,
+            require_authoritative=required,
         )
         self.warn_unshared_lm_head(self.dflash2, self.dflash2_shared_initializers, "DFlash 2")
+
+    def require_dflash2_consumer_layout(self, output_dir, authoritative_names):
+        target = ir.load(os.path.join(output_dir, self.decoder.filename))
+        drafter = ir.load(os.path.join(output_dir, self.dflash2.filename))
+        target_lm = next(
+            (
+                node
+                for node in target.graph
+                if node.op_type == "MatMulNBits"
+                and len(node.inputs) >= 3
+                and node.inputs[1].name == authoritative_names[1]
+            ),
+            None,
+        )
+        drafter_lm = next(
+            (
+                node
+                for node in drafter.graph
+                if node.op_type == "MatMulNBits"
+                and len(node.inputs) >= 3
+                and node.inputs[1].name == authoritative_names[1]
+            ),
+            None,
+        )
+        target_embedding = next(
+            (
+                node
+                for node in target.graph
+                if node.op_type == "Gather"
+                and len(node.inputs) >= 2
+                and node.inputs[0].name == authoritative_names[0]
+            ),
+            None,
+        )
+        drafter_embedding = next(
+            (
+                node
+                for node in drafter.graph
+                if node.op_type == "Gather"
+                and len(node.inputs) >= 2
+                and node.inputs[0].name == authoritative_names[0]
+            ),
+            None,
+        )
+        if any(node is None for node in (target_lm, drafter_lm, target_embedding, drafter_embedding)):
+            raise ValueError("Required target-authoritative DFlash embedding or LM-head consumer is missing.")
+
+        for target_node, drafter_node in ((target_lm, drafter_lm), (target_embedding, drafter_embedding)):
+            target_attributes = {name: attribute.value for name, attribute in target_node.attributes.items()}
+            drafter_attributes = {name: attribute.value for name, attribute in drafter_node.attributes.items()}
+            if target_attributes != drafter_attributes:
+                raise ValueError(
+                    f"DFlash consumer '{drafter_node.name}' does not match the target layout at '{target_node.name}'."
+                )
+
+        target_lm_inputs = [value.name for value in target_lm.inputs][1:]
+        drafter_lm_inputs = [value.name for value in drafter_lm.inputs][1:]
+        if target_lm_inputs != list(authoritative_names[1:]) or drafter_lm_inputs != target_lm_inputs:
+            raise ValueError("DFlash LM-head inputs do not match the target-authoritative initializer set.")
 
     def warn_unshared_lm_head(self, drafter, shared, drafter_name):
         """Report a drafter head that stayed a separate copy instead of folding onto the target's.

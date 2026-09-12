@@ -13,7 +13,7 @@ import torch
 from models.builders.base import Model
 from models.builders.dflash2 import DFlash2Builder
 from models.builders.mtp import MTPModel
-from models.builders.qwen import Qwen35MoEModel
+from models.builders.qwen import Qwen35MoEModel, Qwen35TextModel
 
 TARGET_LAYER_IDS = [1, 11, 21]
 AUX_LAYERS = [layer_id + 1 for layer_id in TARGET_LAYER_IDS]
@@ -72,6 +72,62 @@ def test_absent_option_builds_no_drafter(tmp_path):
     model.make_dflash2_model(str(tmp_path))
 
     assert model.dflash2 is None
+
+
+def test_qwen35_target_quantization_options_are_applied(monkeypatch):
+    def init(model, _config, _io_dtype, _onnx_dtype, _ep, _cache_dir, _extra_options):
+        model.mlp_attrs = {"fuse_gate_up": False}
+        model.layernorm_attrs = {}
+        model.rope_attrs = {"cast": {}}
+
+    monkeypatch.setattr(Qwen35TextModel.__mro__[1], "__init__", init)
+    monkeypatch.setattr(Qwen35TextModel, "configure_gated_delta_net_io", lambda self: None)
+
+    model = Qwen35TextModel(
+        types.SimpleNamespace(),
+        ir.DataType.FLOAT16,
+        ir.DataType.INT4,
+        "cuda",
+        None,
+        {"fuse_mlp_gate_up": True, "quantize_linear_attention_gates": True},
+    )
+
+    assert model.mlp_attrs["fuse_gate_up"] is True
+    assert model.quantize_linear_attention_gates is True
+
+
+@pytest.mark.parametrize(
+    ("enabled", "excluded"),
+    [
+        (False, ["/model/layers.2/linear_attn/b_proj/MatMul", "/model/layers.2/linear_attn/a_proj/MatMul"]),
+        (True, []),
+    ],
+)
+def test_qwen35_linear_attention_gate_quantization_is_opt_in(enabled, excluded):
+    model = object.__new__(Qwen35TextModel)
+    model.quantize_linear_attention_gates = enabled
+    model.use_paged_attention = True
+    model.io_dtype = ir.DataType.FLOAT16
+    model.make_matmul = lambda *_args, **_kwargs: None
+    model.require_dense_linear_attention_gate = lambda *_args, **_kwargs: None
+    excluded_nodes = []
+    model.exclude_node_from_quantization = excluded_nodes.append
+    model.make_initializer = lambda *_args, **_kwargs: None
+    a_proj = types.SimpleNamespace(exclude_from_quantization=True)
+    b_proj = types.SimpleNamespace(exclude_from_quantization=True)
+    attention = types.SimpleNamespace(
+        in_proj_qkv=object(),
+        in_proj_z=object(),
+        in_proj_b=b_proj,
+        in_proj_a=a_proj,
+        conv1d=types.SimpleNamespace(weight=object()),
+    )
+
+    model.make_linear_attention_input_proj(2, attention, "root")
+
+    assert excluded_nodes == excluded
+    assert a_proj.exclude_from_quantization == (not enabled)
+    assert b_proj.exclude_from_quantization == (not enabled)
 
 
 def test_drafter_requires_paged_attention(tmp_path):
@@ -288,14 +344,51 @@ def test_precision_defaults_to_dense_bf16(tmp_path):
     assert model.block_drafter_quant("bf16") is None
 
 
+def test_full_constant_quantization_requires_integer_precision(tmp_path):
+    model = _composite()
+
+    with pytest.raises(ValueError, match="dflash2_precision=int4 or int8"):
+        model.make_dflash2_init(
+            io_dtype=None,
+            extra_options={
+                "dflash2_path": _draft_checkpoint(tmp_path),
+                "dflash2_quantize_all_constant": True,
+            },
+        )
+
+
+def test_required_target_embedding_accepts_untied_target(tmp_path):
+    model = _composite()
+    model.decoder.tied_quantized_embeddings = False
+
+    model.make_dflash2_init(
+        io_dtype=None,
+        extra_options={
+            "dflash2_path": _draft_checkpoint(tmp_path),
+            "dflash2_precision": "int4",
+            "dflash2_require_target_embedding_and_lm_head": True,
+        },
+    )
+
+    assert model.dflash2_attrs["require_target_embedding_and_lm_head"] is True
+
+
 def test_quantized_drafter_reuses_the_targets_lm_head_names():
     quant = _quant_composite().block_drafter_quant("int4")
 
     assert quant["bits"] == 4
     assert quant["block_size"] == 32
     assert quant["prepack"] == 1
+    assert quant["accuracy_level"] == 0
     # Folding onto the target's copy only works if the drafter quantizes its head identically.
     assert quant["lm_head"] == {"bits": 4, "block_size": 32, "prepack": 1}
+
+
+def test_quantized_drafter_reuses_the_targets_accuracy_level():
+    model = _quant_composite()
+    model.decoder.quant_attrs["accuracy_level"] = 3
+
+    assert model.block_drafter_quant("int4")["accuracy_level"] == 3
 
 
 @pytest.mark.parametrize(
@@ -366,6 +459,41 @@ def test_quantized_body_emits_matmulnbits_without_transposing(tmp_path):
     assert node.attributes["N"].value == 16
     # MatMulNBits takes [N, K], so the dense path's transpose must not be applied.
     assert tuple(builder.graph.initializers["probe.MatMul.weight_Q4"].const_value.shape) == (16, 1, 4)
+
+
+@pytest.mark.parametrize(
+    "quantize_all_constant,expected_op",
+    [(False, "MatMul"), (True, "MatMulNBits")],
+)
+def test_dynamic_convolution_kernel_projection_obeys_full_quantization_option(
+    tmp_path, quantize_all_constant, expected_op
+):
+    builder = DFlash2Builder(
+        _draft_checkpoint(tmp_path),
+        str(tmp_path),
+        ir.DataType.FLOAT16,
+        paged_block_size=256,
+        max_position_embeddings=128,
+        quant={"bits": 4, "block_size": 8, "prepack": 0, "lm_head": None},
+        quantize_all_constant=quantize_all_constant,
+    )
+
+    builder._conv_coefficients(
+        "/dflash2/layers.0/pre_attn_conv",
+        "hidden_states",
+        torch.ones((8, 8)),
+        "num_block",
+    )
+
+    node = next(node for node in builder.graph if node.name.endswith("/kernel_projection/MatMul"))
+    assert node.op_type == expected_op
+    if quantize_all_constant:
+        assert not builder.unquantized_constant_matmuls
+    else:
+        assert node.name in builder.unquantized_constant_matmuls
+
+
+
 
 
 # The prepacked fpA_intB kernel takes FP16 activations only, so the bf16 body must ship the

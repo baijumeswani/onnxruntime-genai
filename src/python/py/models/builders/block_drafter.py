@@ -28,6 +28,7 @@ class BlockDrafterBuilder:
     quant_bits = None
     quant_block_size = 32
     quant_prepack = 0
+    quant_accuracy_level = 0
     # Set only when the target's own LM head is symmetric/`default` quantized, which is the one
     # convention whose initializer names and bytes the drafter can reproduce and share.
     lm_head_quant = None
@@ -45,6 +46,7 @@ class BlockDrafterBuilder:
         self.model = ir.Model(self.graph, ir_version=10, producer_name="onnxruntime-genai")
         self.const_cache: dict[str, str] = {}
         self.const_prefix = const_prefix
+        self.unquantized_constant_matmuls: set[str] = set()
 
     def make_value(self, name, dtype=None, shape=None):
         if name == "":
@@ -130,6 +132,8 @@ class BlockDrafterBuilder:
         initializer_name = weight_name or (name[1:].replace("/", ".") + ".weight")
         if quantize and self.quant_bits and in_features % self.quant_block_size == 0:
             return self.matmul_nbits(name, root_input, weight_tensor, in_features, out_features, rows, initializer_name)
+        if self.quant_bits and in_features % self.quant_block_size == 0:
+            self.unquantized_constant_matmuls.add(name)
         if initializer_name not in self.values:
             self.make_initializer(weight_tensor.T, initializer_name, to=self.io_dtype)
         output = self.out(name)
@@ -168,6 +172,8 @@ class BlockDrafterBuilder:
             "K": in_features,
             "N": out_features,
         }
+        if self.quant_accuracy_level:
+            attributes["accuracy_level"] = self.quant_accuracy_level
         if prepack:
             attributes["weight_prepacked"] = prepack
         output = self.out(name)
@@ -292,6 +298,8 @@ class BlockDrafterBuilder:
         self.make_initializer(qweight, qweight_name)
         self.make_initializer(scales, scales_name, to=self.external_dtype)
         attributes = {"bits": bits, "block_size": block_size, "K": self.hidden_size, "N": self.vocab_size}
+        if self.quant_accuracy_level:
+            attributes["accuracy_level"] = self.quant_accuracy_level
         if prepack:
             attributes["weight_prepacked"] = prepack
         self.make_node(

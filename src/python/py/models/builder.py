@@ -156,6 +156,10 @@ def check_extra_options(
         "windowed_kv_cache",
         "use_device_allocator_for_initializers",
         "exclude_mtp",
+        "fuse_mlp_gate_up",
+        "quantize_linear_attention_gates",
+        "dflash2_quantize_all_constant",
+        "dflash2_require_target_embedding_and_lm_head",
     ]
 
     for key in bools:
@@ -795,6 +799,23 @@ def get_args():
                     layout, the drafter head uses its actual bit width, block size, initializer names,
                     and prepack mode when eligible so `share_initializers` can fold it onto the target's
                     copy. Dense or unsupported target LM-head layouts keep the drafter head dense.
+                dflash2_quantize_all_constant = Quantize every eligible constant-weight DFlash 2
+                    projection, including the dynamic-convolution kernel projections and selector
+                    hidden projection. The selector pair MatMul remains dense because its right-hand
+                    input is dynamic. Requires dflash2_precision=int4 or int8. Default is false.
+                dflash2_require_target_embedding_and_lm_head = Require DFlash 2 to consume the
+                    target's exact dense embedding and quantized LM-head initializers. Binds both
+                    consumers to the target's external-data ranges. Requires a target embedding
+                    compatible with the DFlash checkpoint, a symmetric default MatMulNBits target
+                    head, and dflash2_precision=int4 or int8. The build fails if exact binding cannot
+                    be proven. Default is false.
+                fuse_mlp_gate_up = Fuse compatible Qwen gate and up projections before weight
+                    quantization, then split the combined output before activation. This is limited
+                    to matching dense Qwen projections; LoRA, pre-quantized modules, divergent
+                    dimensions, bias layouts, or quantization placement are rejected. Default is false.
+                quantize_linear_attention_gates = Allow weight-only quantization of Qwen
+                    linear-attention decay and beta gate projections (`a_proj` and `b_proj`).
+                    These small, recurrence-sensitive projections remain dense by default.
                 dspark_path = Path to a DSpark draft checkpoint. Exports an auxiliary `dspark.onnx`
                     block drafter beside the target model and adds a `dspark` section to
                     genai_config.json. Mutually exclusive with dflash2_path. Requires

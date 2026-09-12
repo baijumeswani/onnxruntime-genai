@@ -5,6 +5,7 @@ import json
 import os
 
 import onnx
+import pytest
 from onnx import external_data_helper, helper
 
 from models.builders.qwen import Qwen35MoEModel
@@ -133,6 +134,80 @@ def test_share_mtp_weights_repacks_data_after_staging_metadata(tmp_path):
             "shape": [1],
         },
     ]
+
+
+def test_authoritative_initializer_sharing_uses_source_bytes_even_when_drafter_differs(tmp_path):
+    (tmp_path / "model.onnx.data").write_bytes(b"EMBDQWGTSCAL")
+    (tmp_path / "dflash2.onnx.data").write_bytes(b"embdqwgtSCALkeep")
+    tensors = [
+        ("model.embed_tokens.weight", 0, 4),
+        ("lm_head.MatMul.weight_Q4", 4, 4),
+        ("lm_head.MatMul.weight_scales", 8, 4),
+    ]
+    _make_external_model(tmp_path / "model.onnx", "model.onnx.data", tensors)
+    _make_external_model(
+        tmp_path / "dflash2.onnx",
+        "dflash2.onnx.data",
+        [*tensors, ("dflash2.fc.weight", 12, 4)],
+    )
+
+    model_builder = _make_qwen_mtp_model()
+    shared = model_builder.share_initializers(
+        tmp_path,
+        "model.onnx",
+        "dflash2.onnx",
+        authoritative_names=(
+            "model.embed_tokens.weight",
+            "lm_head.MatMul.weight_Q4",
+            "lm_head.MatMul.weight_scales",
+        ),
+        require_authoritative=True,
+    )
+
+    assert (tmp_path / "dflash2.onnx.data").read_bytes() == b"keep"
+    model = onnx.load(tmp_path / "dflash2.onnx", load_external_data=False)
+    initializers = {tensor.name: tensor for tensor in model.graph.initializer}
+    assert _external_info(initializers["model.embed_tokens.weight"]) == ("model.onnx.data", 0, 4)
+    assert _external_info(initializers["lm_head.MatMul.weight_Q4"]) == ("model.onnx.data", 4, 4)
+    assert _external_info(initializers["lm_head.MatMul.weight_scales"]) == ("model.onnx.data", 8, 4)
+    assert {entry["name"] for entry in shared} == {
+        "model.embed_tokens.weight",
+        "lm_head.MatMul.weight_Q4",
+        "lm_head.MatMul.weight_scales",
+    }
+
+
+def test_required_authoritative_initializer_sharing_fails_when_source_is_missing(tmp_path):
+    (tmp_path / "model.onnx.data").write_bytes(b"EMBDQWGT")
+    (tmp_path / "dflash2.onnx.data").write_bytes(b"embdqwgtSCAL")
+    _make_external_model(
+        tmp_path / "model.onnx",
+        "model.onnx.data",
+        [("model.embed_tokens.weight", 0, 4), ("lm_head.MatMul.weight_Q4", 4, 4)],
+    )
+    _make_external_model(
+        tmp_path / "dflash2.onnx",
+        "dflash2.onnx.data",
+        [
+            ("model.embed_tokens.weight", 0, 4),
+            ("lm_head.MatMul.weight_Q4", 4, 4),
+            ("lm_head.MatMul.weight_scales", 8, 4),
+        ],
+    )
+
+    model_builder = _make_qwen_mtp_model()
+    with pytest.raises(ValueError, match="lm_head.MatMul.weight_scales"):
+        model_builder.share_initializers(
+            tmp_path,
+            "model.onnx",
+            "dflash2.onnx",
+            authoritative_names=(
+                "model.embed_tokens.weight",
+                "lm_head.MatMul.weight_Q4",
+                "lm_head.MatMul.weight_scales",
+            ),
+            require_authoritative=True,
+        )
 
 
 def test_share_mtp_weights_leaves_originals_on_truncated_data(tmp_path):

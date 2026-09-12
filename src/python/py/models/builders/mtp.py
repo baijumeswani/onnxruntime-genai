@@ -75,7 +75,14 @@ class MTPModel:
                 remaining -= read_size
         return True
 
-    def find_shared_initializers(self, source_model, target_model, source_data, target_data):
+    def find_shared_initializers(
+        self,
+        source_model,
+        target_model,
+        source_data,
+        target_data,
+        authoritative_names=(),
+    ):
         source_data_name = os.path.basename(source_data)
         target_data_name = os.path.basename(target_data)
         source_info = {}
@@ -106,12 +113,8 @@ class MTPModel:
                 or target_tensor.length != source_length
             ):
                 continue
-            if self.external_data_equal(
-                source_data,
-                source_offset,
-                target_data,
-                target_tensor.offset,
-                source_length,
+            if name in authoritative_names or self.external_data_equal(
+                source_data, source_offset, target_data, target_tensor.offset, source_length
             ):
                 shared[name] = (source_offset, source_length, target_tensor.offset)
         return source_info, shared
@@ -203,13 +206,25 @@ class MTPModel:
             for name, (source_offset, length, _) in shared.items()
         ]
 
-    def share_initializers(self, output_dir, source_file, target_file):
+    def share_initializers(
+        self,
+        output_dir,
+        source_file,
+        target_file,
+        authoritative_names=(),
+        require_authoritative=False,
+    ):
         source_model_path = os.path.join(output_dir, source_file)
         target_model_path = os.path.join(output_dir, target_file)
         source_data = source_model_path + ".data"
         target_data = target_model_path + ".data"
         required_paths = (source_model_path, target_model_path, source_data, target_data)
         if not all(os.path.exists(path) for path in required_paths):
+            if require_authoritative:
+                missing = [path for path in required_paths if not os.path.exists(path)]
+                raise FileNotFoundError(
+                    "Required target-authoritative initializer files are missing: " + ", ".join(missing) + "."
+                )
             return []
 
         staged_model = target_model_path + ".tmp"
@@ -218,8 +233,17 @@ class MTPModel:
             source_model = ir.load(source_model_path)
             target_model = ir.load(target_model_path)
             source_info, shared = self.find_shared_initializers(
-                source_model, target_model, source_data, target_data
+                source_model,
+                target_model,
+                source_data,
+                target_data,
+                authoritative_names=set(authoritative_names),
             )
+            missing = set(authoritative_names) - set(shared)
+            if missing:
+                raise ValueError(
+                    "Could not bind required target-authoritative initializers: " + ", ".join(sorted(missing)) + "."
+                )
             if not shared:
                 return []
             self.stage_shared_initializers(target_model, os.path.basename(source_data), target_data, shared)
@@ -228,10 +252,14 @@ class MTPModel:
             for staged_path in (staged_data, staged_model):
                 if os.path.exists(staged_path):
                     os.remove(staged_path)
+            if require_authoritative:
+                raise
             print(f"Warning: could not share MTP initializers ({exc}); duplicated copies remain in {target_data}.")
             return []
 
         if not self.replace_shared_initializer_files(target_model_path, target_data, staged_model, staged_data):
+            if require_authoritative:
+                raise RuntimeError("Could not commit required target-authoritative initializers.")
             print(f"Warning: could not commit shared MTP initializers; duplicated copies remain in {target_data}.")
             return []
 
