@@ -332,6 +332,46 @@ See [the full ORT DFlash2 versus llama MTP report](QWEN38_ORT_DFLASH2_VS_LLAMA_M
 for the pinned model revision/checksum, MTP tensor inventory, native timing
 and acceptance counters, measurement definitions, and reproduction commands.
 
+### Follow-up: concurrent 64K SWE-style requests to EOS
+
+All **15 requests** across cohorts **[1, 2, 4, 8]** completed at natural EOS,
+with 65,536 input tokens per request and arrivals one second apart. Every cohort
+demonstrated full-width speculative execution: N token-emitting requests and
+N speculative rounds in a single target/drafter forward pair.
+
+**These measurements use a local EOS-classification fix on GenAI `4809ff9d`,
+not unmodified upstream `main`.** The original qualified runtime remains
+unchanged. All four rows were remeasured with the same isolated corrected build;
+earlier unpatched attempts are excluded.
+
+| Concurrent requests | Median TTFT, s | Effective prompt tok/s | Aggregate decode tok/s during common overlap | Median request decode tok/s | Total outputs |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 82.66 | 792.80 | **33.11** | 33.11 | 2,194 |
+| 2 | 134.46 | 754.86 | **48.43** | 19.84 | 4,180 |
+| 4 | 224.68 | 746.99 | **69.68** | 9.46 | 11,449 |
+| 8 | 391.28 | 742.32 | **94.06** | 6.05 | 21,901 |
+
+The common all-decoding intervals lasted 60.89-97.24 seconds. At eight concurrent
+requests, aggregate decode throughput was **2.84x** the single-request value.
+This is not per-user delivery speed: per-request rates include competing long
+prefills, during which the engine disables optional draft rows in mixed
+prefill/decode steps. Effective prompt throughput also includes scheduling and
+interleaved generation; it is not isolated prefill-kernel throughput.
+
+The service retained `max_batch_size=8` and an expanded `num_blocks=2688` budget
+for every point: **2,638 actual target pages** after the windowed drafter
+reservation. There was sufficient capacity for all observed sequence lengths,
+with no `CAPACITY_BLOCKED` notices. "No queueing" means no cache-capacity-driven
+waiting, not absence of compute scheduling. Sampled Windows GPU memory peaked
+at **31.25 GiB dedicated + 42.17 GiB shared**; these counters do not establish
+paging traffic or dedicated-memory residency.
+
+See [the full concurrent 64K EOS report](QWEN38_64K_CONCURRENT_SWE_EOS_PERFORMANCE.md)
+for all per-request results, end-to-end throughput, concurrency evidence, cache
+math, local-patch provenance, and reproduction commands. These are one-pass
+SWE-bench-style source-analysis workloads, not official SWE-bench scores or an
+isolated batch-scaling ablation; the issue mix changes with cohort size.
+
 ### High-acceptance code-copy ceiling
 
 This prompt asks the model to continue code already present in its context.
