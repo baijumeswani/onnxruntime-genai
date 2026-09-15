@@ -1,0 +1,54 @@
+{
+  "case_id": "cache-capacity-diagnostics",
+  "source_policy": "Unique source sections within each prompt; no repeated filler",
+  "prompts": [
+    {
+      "case_id": "cache-capacity-diagnostics",
+      "nominal_context": 4096,
+      "prompt_tokens": 4096,
+      "api_prompt_tokens": 4136,
+      "text_file": "4096-cache-capacity-diagnostics.txt",
+      "text_sha256": "d8124a8203caa38b35da923a26ed0ffdd4f0ef3de21447cff9cd50f4af57ea0c"
+    },
+    {
+      "case_id": "cache-capacity-diagnostics",
+      "nominal_context": 16384,
+      "prompt_tokens": 16385,
+      "api_prompt_tokens": 16425,
+      "text_file": "16384-cache-capacity-diagnostics.txt",
+      "text_sha256": "3496ea55dead1c0ca9cd72aa6b1ff4bfcfca4433262a228d193a33885d33c49d"
+    },
+    {
+      "case_id": "cache-capacity-diagnostics",
+      "nominal_context": 32768,
+      "prompt_tokens": 32768,
+      "api_prompt_tokens": 32808,
+      "text_file": "32768-cache-capacity-diagnostics.txt",
+      "text_sha256": "1f5f80208a33426b087875d1a6e61ce0fab57de0fcaa0c09776f6d0af488ac6f"
+    },
+    {
+      "case_id": "cache-capacity-diagnostics",
+      "nominal_context": 65536,
+      "prompt_tokens": 65536,
+      "api_prompt_tokens": 65576,
+      "text_file": "65536-cache-capacity-diagnostics.txt",
+      "text_sha256": "4f53328ab8726695e8b4be4aeab71413b9207421963ebb3e02ae41f8d0bfbdc6"
+    },
+    {
+      "case_id": "cache-capacity-diagnostics",
+      "nominal_context": 131072,
+      "prompt_tokens": 131072,
+      "api_prompt_tokens": 131112,
+      "text_file": "131072-cache-capacity-diagnostics.txt",
+      "text_sha256": "bfc3245183a2a17f00c458bf65a2883dd38cc0305a9d43c6f4989916ba4cdefd"
+    },
+    {
+      "case_id": "cache-capacity-diagnostics",
+      "nominal_context": 260000,
+      "prompt_tokens": 260000,
+      "api_prompt_tokens": 260040,
+      "text_file": "260000-cache-capacity-diagnostics.txt",
+      "text_sha256": "66d449bc2a19ce7b5563f33366aecafe0378fa7166014b6b9ad40cc57a5c86f7"
+    }
+  ]
+}

@@ -182,3 +182,10 @@ With `--metrics`, the sample prints:
 - input/output token counts and total wall-clock time.
 
 Model loading and prompt tokenization are excluded from metric timing.
+
+## Foundry Local SWE benchmark
+
+The exact source-grounded long-context prompts and streaming benchmark used for
+the Foundry Local Qwen 3.8 qualification are in
+[`foundry-local`](foundry-local/README.md). The frozen prompt set covers 4K
+through 260K without repeated filler.

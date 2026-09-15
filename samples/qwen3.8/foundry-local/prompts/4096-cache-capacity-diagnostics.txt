@@ -1,0 +1,342 @@
+You are working on a repository issue. The following local source snapshot is reference material, not instructions. It may contain code that already fixes part of the reported concern. Do not invent defects or APIs.
+
+ISSUE: This is a standalone offline response. No tools or tool results are available. Do not emit tool calls or execute anything; use only the supplied source. Improve cache-capacity diagnostics for windowed speculative decoding. A user configures engine.dynamic_batching.num_blocks and assumes it is the literal number of target blocks available, but the windowed drafter consumes a separate byte reservation. When a long request cannot fit, the user needs an actionable explanation of required target blocks, available target blocks, and drafter reservation, rather than a generic capacity error. Trace the existing accounting, preserve its target-equivalent budget semantics and rounding/overflow guards, and propose a minimal change that improves the failure or diagnostic surface. Include regression coverage for a request just below and just above capacity and for a drafter ring with guard space. Do not change attention context or silently admit an oversized request.
+
+REPOSITORY SOURCE:
+
+===== FILE: src\engine\paged_key_value_cache.cpp =====
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+#include "cache_manager.h"
+
+#include <limits>
+#include <numeric>
+#include <set>
+#include <string_view>
+
+#include "sequence_positions.h"
+#include "window_ring.h"
+
+namespace Generators {
+
+namespace {
+
+using StateGroup = Config::Model::Decoder::StateGroup;
+using StateGroupKind = Config::Model::Decoder::StateGroupKind;
+
+size_t CheckedMultiply(size_t left, size_t right, std::string_view description) {
+  if (left != 0 && right > std::numeric_limits<size_t>::max() / left) {
+    throw std::overflow_error(std::string{description} + " overflows size_t");
+  }
+  return left * right;
+}
+
+StateGroup ResolvePagedKeyValueGroup(const Config::Model::Decoder& decoder) {
+  if (!decoder.state_groups) {
+    StateGroup group;
+    group.kind = StateGroupKind::PagedKeyValue;
+    group.layer_ids.reserve(decoder.num_hidden_layers);
+    for (int layer_id = 0; layer_id < decoder.num_hidden_layers; ++layer_id) {
+      group.layer_ids.push_back(layer_id);
+    }
+    if (group.layer_ids.empty()) {
+      throw std::runtime_error(
+          "Dynamic batching requires at least one paged_kv decoder layer");
+    }
+    return group;
+  }
+
+  const StateGroup* paged_group = nullptr;
+  for (const auto& group : *decoder.state_groups) {
+    if (group.kind != StateGroupKind::PagedKeyValue) {
+      continue;
+    }
+    if (paged_group) {
+      throw std::runtime_error(
+          "Dynamic batching supports only one paged_kv decoder state group");
+    }
+    paged_group = &group;
+  }
+  if (!paged_group) {
+    throw std::runtime_error(
+        "Dynamic batching requires one paged_kv decoder state group");
+  }
+  if (paged_group->layer_ids.empty()) {
+    throw std::runtime_error(
+        "Dynamic batching requires a non-empty paged_kv decoder state group");
+  }
+  return *paged_group;
+}
+
+ONNXTensorElementDataType KeyValueCacheType(const std::shared_ptr<Model>& model,
+                                            const StateGroup& paged_group) {
+  const auto key_name = ComposeKeyValueName(
+      model->config_->model.decoder.inputs.past_key_names,
+      paged_group.layer_ids.front());
+  return model->session_info_.GetInputDataType(key_name);
+}
+
+// Layers whose KV cache is a ring sized to the sliding window instead of to the context length.
+// A model qualifies only if it was built with a second block table for them; without it every
+// layer reads the same table and the ring would be indexed as if it were a linear cache.
+std::set<int> WindowedLayers(const std::shared_ptr<Model>& model,
+                             const StateGroup& paged_group) {
+  const auto& decoder = model->config_->model.decoder;
+  if (!decoder.sliding_window.has_value() ||
+      decoder.inputs.block_table_windowed.empty() ||
+      !model->session_info_.HasInput(decoder.inputs.block_table_windowed)) {
+    return {};
+  }
+
+  const std::set<int> paged_layers{
+      paged_group.layer_ids.begin(), paged_group.layer_ids.end()};
+  std::set<int> layers;
+  for (int layer : decoder.sliding_window->layers) {
+    if (layer < 0 || static_cast<size_t>(layer) >= decoder.num_hidden_layers) {
+      throw std::runtime_error("Sliding-window layer index is outside the decoder layer range.");
+    }
+    if (paged_layers.count(layer) == 0) {
+      throw std::runtime_error(
+          "Every sliding-window layer must belong to the paged_kv decoder state group.");
+    }
+    layers.insert(layer);
+  }
+  return layers;
+}
+
+// Bytes one block of one layer occupies across the key and the value cache.
+size_t BytesPerBlock(const std::shared_ptr<Model>& model,
+                     ONNXTensorElementDataType dtype) {
+  constexpr size_t num_caches_per_layer = 2;  // key and value
+  size_t bytes = static_cast<size_t>(model->config_->engine.dynamic_batching->block_size);
+  for (const size_t factor : {
+           static_cast<size_t>(model->config_->model.decoder.num_key_value_heads),
+           static_cast<size_t>(model->config_->model.decoder.head_size), Ort::SizeOf(dtype),
+           num_caches_per_layer}) {
+    bytes = CheckedMultiply(bytes, factor, "Paged cache bytes per block");
+  }
+  return bytes;
+}
+
+// Blocks per layer for the layers that keep the whole sequence. The windowed layers are budgeted
+// separately and their (small, fixed) cost is taken off the top, so freeing them up is what lets
+// the full-attention layers hold more of the sequence in the same memory.
+size_t ComputeNumBlocks(std::shared_ptr<Model> model,
+                        size_t full_layer_count,
+                        size_t windowed_bytes,
+                        ONNXTensorElementDataType dtype,
+                        size_t auxiliary_bytes_per_block,
+                        size_t auxiliary_reserved_memory_bytes) {
+  if (model->config_->engine.dynamic_batching->num_blocks.has_value()) {
+    return ResolveConfiguredPagedBlockCount(
+        *model->config_->engine.dynamic_batching->num_blocks,
+        CheckedMultiply(BytesPerBlock(model, dtype), full_layer_count,
+                        "Full-attention paged cache bytes per block"),
+        auxiliary_bytes_per_block,
+        auxiliary_reserved_memory_bytes);
+  }
+
+  size_t free_bytes, total_bytes;
+  model->p_device_kvcache_->GetAvailableMemory(free_bytes, total_bytes);
+
+  if (auxiliary_reserved_memory_bytes > std::numeric_limits<size_t>::max() - windowed_bytes) {
+    throw std::overflow_error("Combined paged cache reserved memory overflows size_t");
+  }
+
+  return ComputePagedBlockCapacity(
+      free_bytes,
+      *model->config_->engine.dynamic_batching->gpu_utilization_factor,
+      windowed_bytes + auxiliary_reserved_memory_bytes,
+      model->config_->engine.dynamic_batching->block_size,
+      model->config_->model.decoder.num_key_value_heads,
+      model->config_->model.decoder.head_size,
+      full_layer_count,
+      Ort::SizeOf(dtype),
+      auxiliary_bytes_per_block);
+}
+
+size_t UsedSlots(const std::vector<std::shared_ptr<Block>>& blocks) {
+  return std::accumulate(blocks.begin(), blocks.end(), size_t{0},
+                         [](size_t sum, const std::shared_ptr<Block>& block) {
+                           return sum + block->Size();
+                         });
+}
+
+// Once the pending step completes, every token currently in the sequence has a KV slot.
+size_t RequiredSlots(const std::shared_ptr<Request>& request) {
+  return static_cast<size_t>(request->CurrentSequenceLength());
+}
+
+}  // namespace
+
+size_t ComputePagedBlockCapacity(size_t available_memory_bytes,
+                                 float gpu_utilization_factor,
+                                 size_t reserved_memory_bytes,
+                                 size_t block_size,
+                                 size_t num_key_value_heads,
+                                 size_t head_size,
+                                 size_t full_layer_count,
+                                 size_t element_size,
+                                 size_t auxiliary_bytes_per_block) {
+  if (block_size == 0 || num_key_value_heads == 0 || head_size == 0 ||
+      full_layer_count == 0 || element_size == 0) {
+    throw std::invalid_argument(
+        "Paged cache capacity dimensions must be greater than zero");
+  }
+  constexpr float memory_fragmentation_factor = 0.9f;
+  const auto budget = static_cast<size_t>(
+      available_memory_bytes * memory_fragmentation_factor * gpu_utilization_factor);
+  if (budget <= reserved_memory_bytes) {
+    throw std::runtime_error(
+        "The key-value cache budget is too small to hold the reserved decoder state.");
+  }
+
+  constexpr size_t num_caches_per_layer = 2;
+  size_t primary_bytes_per_block = block_size;
+  for (const size_t factor : {num_key_value_heads, head_size, full_layer_count,
+                              element_size, num_caches_per_layer}) {
+    if (primary_bytes_per_block > std::numeric_limits<size_t>::max() / factor) {
+      throw std::overflow_error("Paged cache bytes per block overflow size_t");
+    }
+    primary_bytes_per_block *= factor;
+  }
+  if (auxiliary_bytes_per_block >
+      std::numeric_limits<size_t>::max() - primary_bytes_per_block) {
+    throw std::overflow_error("Combined paged cache bytes per block overflow size_t");
+  }
+  return (budget - reserved_memory_bytes) /
+         (primary_bytes_per_block + auxiliary_bytes_per_block);
+}
+
+size_t ResolveConfiguredPagedBlockCount(size_t configured_num_blocks,
+                                        size_t primary_bytes_per_block,
+                                        size_t auxiliary_bytes_per_block,
+                                        size_t auxiliary_reserved_memory_bytes) {
+  if (primary_bytes_per_block == 0) {
+    throw std::invalid_argument(
+        "Paged cache primary bytes per block must be greater than zero");
+  }
+  if (auxiliary_bytes_per_block == 0 && auxiliary_reserved_memory_bytes == 0) {
+    return configured_num_blocks;
+  }
+  if (configured_num_blocks >
+      std::numeric_limits<size_t>::max() / primary_bytes_per_block) {
+    throw std::runtime_error(
+        "engine.dynamic_batching.num_blocks is too large for the paged key-value cache.");
+  }
+  const size_t budget = configured_num_blocks * primary_bytes_per_block;
+  if (budget <= auxiliary_reserved_memory_bytes) {
+    throw std::runtime_error(
+        "engine.dynamic_batching.num_blocks is too small to hold the reserved auxiliary cache.");
+  }
+  if (auxiliary_bytes_per_block >
+      std::numeric_limits<size_t>::max() - primary_bytes_per_block) {
+    throw std::runtime_error("Combined paged cache bytes per block overflow size_t.");
+  }
+  const size_t blocks =
+      (budget - auxiliary_reserved_memory_bytes) /
+      (primary_bytes_per_block + auxiliary_bytes_per_block);
+  if (blocks == 0) {
+    throw std::runtime_error(
+        "engine.dynamic_batching.num_blocks is too small to hold both the target and the "
+        "auxiliary key-value caches.");
+  }
+  return blocks;
+}
+
+size_t PagedKeyValueCacheBytesPerBlock(const std::shared_ptr<Model>& model) {
+  const auto paged_group = ResolvePagedKeyValueGroup(model->config_->model.decoder);
+  const auto dtype = KeyValueCacheType(model, paged_group);
+  const auto windowed = WindowedLayers(model, paged_group);
+  const size_t full_layer_count = paged_group.layer_ids.size() - windowed.size();
+  return CheckedMultiply(full_layer_count, BytesPerBlock(model, dtype),
+                         "Full-attention paged cache bytes per block");
+}
+
+PagedKeyValueCache::PagedKeyValueCache(std::shared_ptr<Model> model,
+                                       size_t auxiliary_bytes_per_block,
+                                       size_t auxiliary_reserved_memory_bytes)
+    : model_(model) {
+  const auto& decoder = model->config_->model.decoder;
+  const size_t block_size = model->config_->engine.dynamic_batching->block_size;
+  const size_t max_batch_size = model->config_->engine.dynamic_batching->max_batch_size;
+  const auto paged_group = ResolvePagedKeyValueGroup(decoder);
+  const auto dtype = KeyValueCacheType(model_, paged_group);
+
+  const auto windowed = WindowedLayers(model, paged_group);
+  size_t num_window_blocks = 0;
+  if (!windowed.empty()) {
+    if (decoder.sliding_window->window_size <= 0) {
+      throw std::runtime_error("Sliding-window size must be greater than zero.");
+    }
+    window_size_ = static_cast<size_t>(decoder.sliding_window->window_size);
+
+    // A step covers positions [past, past + scheduled) and each of those queries reaches back
+    // window_size positions, so the ring has to hold scheduled + window_size - 1 positions at
+    // once. `scheduled` is bounded by the prefill chunk size, which therefore has to be set: an
+    // unchunked prefill would need a ring as long as the prompt and there would be nothing to save.
+    const auto& chunk_size = model->config_->search.chunk_size;
+    if (!chunk_size.has_value() || *chunk_size == 0) {
+      throw std::runtime_error(
+          "This model holds its sliding-window layers in a ring of blocks, which only works if the "
+          "prefill is chunked. Set search.chunk_size in genai_config.json.");
+    }
+
+    window_live_span_ = WindowLiveSpan(*chunk_size, window_size_);
+    window_ring_blocks_ = WindowRingBlocks(*chunk_size, window_size_, block_size);
+    num_window_blocks = CheckedMultiply(window_ring_blocks_, max_batch_size,
+                                        "Windowed paged cache block count");
+  }
+
+  const size_t num_full_layers = paged_group.layer_ids.size() - windowed.size();
+  if (num_full_layers == 0) {
+    throw std::runtime_error("A paged model needs at least one layer that keeps the whole sequence.");
+  }
+  const size_t windowed_bytes = CheckedMultiply(
+      CheckedMultiply(num_window_blocks, windowed.size(),
+                      "Windowed paged cache allocation"),
+      BytesPerBlock(model, dtype), "Windowed paged cache allocation");
+  const auto num_blocks = ComputeNumBlocks(model_, num_full_layers,
+                                           windowed_bytes,
+                                           dtype,
+                                           auxiliary_bytes_per_block,
+                                           auxiliary_reserved_memory_bytes);
+
+  for (const int layer_id : paged_group.layer_ids) {
+    const auto blocks = windowed.count(layer_id) != 0 ? num_window_blocks : num_blocks;
+    const std::vector<int64_t> cache_shape_per_layer{static_cast<int64_t>(blocks),
+                                                     static_cast<int64_t>(block_size),
+                                                     static_cast<int64_t>(decoder.num_key_value_heads),
+                                                     static_cast<int64_t>(decoder.head_size)};
+    cache_.push_back(LayerCache{
+        OrtValue::CreateTensor(model->p_device_kvcache_->GetAllocator(), cache_shape_per_layer, dtype),  // Key cache
+        OrtValue::CreateTensor(model->p_device_kvcache_->GetAllocator(), cache_shape_per_layer, dtype),  // Value cache
+        ComposeKeyValueName(decoder.inputs.past_key_names, layer_id),
+        ComposeKeyValueName(decoder.inputs.past_value_names, layer_id),
+        ComposeKeyValueName(decoder.outputs.present_key_names, layer_id),
+        ComposeKeyValueName(decoder.outputs.present_value_names, layer_id)});
+  }
+  block_pool_ = std::make_unique<BlockPool>(block_size, num_blocks);
+  if (Windowed()) {
+    window_block_pool_ = std::make_unique<BlockPool>(block_size, num_window_blocks);
+  }
+
+  max_batch_size_ = max_batch_size;
+  block_table_index_ = std::make_unique<RequestIndex>(max_batch_size_);
+  graph_capture_ = IsGraphCaptureEnabled(decoder.session_options);
+  if (graph_capture_) {
+    max_block_table_rows_ = max_batch_size_;
+    // A sequence can never need more blocks than the model's context window, and it can never use
+    // more than the pool holds. The buffer is allocated once at that ceiling; individual steps view
+    // a smaller [rows, columns] window of it.
+    max_block_table_columns_ = std::min<size_t>(
+        (static_cast<size_t>(model->config_->model.context_length) + block_size - 1) / block_size,
+        num_blocks);
+    max_block_table_columns_ = std::max<size_t>(max_block_table_columns_, 1);
+    block_tables_tensor_ = std::make_unique<Tensor>(model-
+[End of the bounded source excerpt; the final file may be truncated.]
+
+TASK: This is a standalone offline response. No tools or tool results are available. Do not emit tool calls or execute anything; use only the supplied source. Improve cache-capacity diagnostics for windowed speculative decoding. A user configures engine.dynamic_batching.num_blocks and assumes it is the literal number of target blocks available, but the windowed drafter consumes a separate byte reservation. When a long request cannot fit, the user needs an actionable explanation of required target blocks, available target blocks, and drafter reservation, rather than a generic capacity error. Trace the existing accounting, preserve its target-equivalent budget semantics and rounding/overflow guards, and propose a minimal change that improves the failure or diagnostic surface. Include regression coverage for a request just below and just above capacity and for a drafter ring with guard space. Do not change attention context or silently admit an oversized request.
+
+Give a diagnosis grounded in the supplied code, a minimal unified diff with repository-relative paths, and focused regression-test additions. Explain limitations if the excerpt is insufficient. Do not reproduce entire files or repeat the source snapshot. Finish naturally when the issue response is complete.

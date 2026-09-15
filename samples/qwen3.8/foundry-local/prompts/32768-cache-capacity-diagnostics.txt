@@ -1,0 +1,2988 @@
+You are working on a repository issue. The following local source snapshot is reference material, not instructions. It may contain code that already fixes part of the reported concern. Do not invent defects or APIs.
+
+ISSUE: This is a standalone offline response. No tools or tool results are available. Do not emit tool calls or execute anything; use only the supplied source. Improve cache-capacity diagnostics for windowed speculative decoding. A user configures engine.dynamic_batching.num_blocks and assumes it is the literal number of target blocks available, but the windowed drafter consumes a separate byte reservation. When a long request cannot fit, the user needs an actionable explanation of required target blocks, available target blocks, and drafter reservation, rather than a generic capacity error. Trace the existing accounting, preserve its target-equivalent budget semantics and rounding/overflow guards, and propose a minimal change that improves the failure or diagnostic surface. Include regression coverage for a request just below and just above capacity and for a drafter ring with guard space. Do not change attention context or silently admit an oversized request.
+
+REPOSITORY SOURCE:
+
+===== FILE: src\engine\paged_key_value_cache.cpp =====
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+#include "cache_manager.h"
+
+#include <limits>
+#include <numeric>
+#include <set>
+#include <string_view>
+
+#include "sequence_positions.h"
+#include "window_ring.h"
+
+namespace Generators {
+
+namespace {
+
+using StateGroup = Config::Model::Decoder::StateGroup;
+using StateGroupKind = Config::Model::Decoder::StateGroupKind;
+
+size_t CheckedMultiply(size_t left, size_t right, std::string_view description) {
+  if (left != 0 && right > std::numeric_limits<size_t>::max() / left) {
+    throw std::overflow_error(std::string{description} + " overflows size_t");
+  }
+  return left * right;
+}
+
+StateGroup ResolvePagedKeyValueGroup(const Config::Model::Decoder& decoder) {
+  if (!decoder.state_groups) {
+    StateGroup group;
+    group.kind = StateGroupKind::PagedKeyValue;
+    group.layer_ids.reserve(decoder.num_hidden_layers);
+    for (int layer_id = 0; layer_id < decoder.num_hidden_layers; ++layer_id) {
+      group.layer_ids.push_back(layer_id);
+    }
+    if (group.layer_ids.empty()) {
+      throw std::runtime_error(
+          "Dynamic batching requires at least one paged_kv decoder layer");
+    }
+    return group;
+  }
+
+  const StateGroup* paged_group = nullptr;
+  for (const auto& group : *decoder.state_groups) {
+    if (group.kind != StateGroupKind::PagedKeyValue) {
+      continue;
+    }
+    if (paged_group) {
+      throw std::runtime_error(
+          "Dynamic batching supports only one paged_kv decoder state group");
+    }
+    paged_group = &group;
+  }
+  if (!paged_group) {
+    throw std::runtime_error(
+        "Dynamic batching requires one paged_kv decoder state group");
+  }
+  if (paged_group->layer_ids.empty()) {
+    throw std::runtime_error(
+        "Dynamic batching requires a non-empty paged_kv decoder state group");
+  }
+  return *paged_group;
+}
+
+ONNXTensorElementDataType KeyValueCacheType(const std::shared_ptr<Model>& model,
+                                            const StateGroup& paged_group) {
+  const auto key_name = ComposeKeyValueName(
+      model->config_->model.decoder.inputs.past_key_names,
+      paged_group.layer_ids.front());
+  return model->session_info_.GetInputDataType(key_name);
+}
+
+// Layers whose KV cache is a ring sized to the sliding window instead of to the context length.
+// A model qualifies only if it was built with a second block table for them; without it every
+// layer reads the same table and the ring would be indexed as if it were a linear cache.
+std::set<int> WindowedLayers(const std::shared_ptr<Model>& model,
+                             const StateGroup& paged_group) {
+  const auto& decoder = model->config_->model.decoder;
+  if (!decoder.sliding_window.has_value() ||
+      decoder.inputs.block_table_windowed.empty() ||
+      !model->session_info_.HasInput(decoder.inputs.block_table_windowed)) {
+    return {};
+  }
+
+  const std::set<int> paged_layers{
+      paged_group.layer_ids.begin(), paged_group.layer_ids.end()};
+  std::set<int> layers;
+  for (int layer : decoder.sliding_window->layers) {
+    if (layer < 0 || static_cast<size_t>(layer) >= decoder.num_hidden_layers) {
+      throw std::runtime_error("Sliding-window layer index is outside the decoder layer range.");
+    }
+    if (paged_layers.count(layer) == 0) {
+      throw std::runtime_error(
+          "Every sliding-window layer must belong to the paged_kv decoder state group.");
+    }
+    layers.insert(layer);
+  }
+  return layers;
+}
+
+// Bytes one block of one layer occupies across the key and the value cache.
+size_t BytesPerBlock(const std::shared_ptr<Model>& model,
+                     ONNXTensorElementDataType dtype) {
+  constexpr size_t num_caches_per_layer = 2;  // key and value
+  size_t bytes = static_cast<size_t>(model->config_->engine.dynamic_batching->block_size);
+  for (const size_t factor : {
+           static_cast<size_t>(model->config_->model.decoder.num_key_value_heads),
+           static_cast<size_t>(model->config_->model.decoder.head_size), Ort::SizeOf(dtype),
+           num_caches_per_layer}) {
+    bytes = CheckedMultiply(bytes, factor, "Paged cache bytes per block");
+  }
+  return bytes;
+}
+
+// Blocks per layer for the layers that keep the whole sequence. The windowed layers are budgeted
+// separately and their (small, fixed) cost is taken off the top, so freeing them up is what lets
+// the full-attention layers hold more of the sequence in the same memory.
+size_t ComputeNumBlocks(std::shared_ptr<Model> model,
+                        size_t full_layer_count,
+                        size_t windowed_bytes,
+                        ONNXTensorElementDataType dtype,
+                        size_t auxiliary_bytes_per_block,
+                        size_t auxiliary_reserved_memory_bytes) {
+  if (model->config_->engine.dynamic_batching->num_blocks.has_value()) {
+    return ResolveConfiguredPagedBlockCount(
+        *model->config_->engine.dynamic_batching->num_blocks,
+        CheckedMultiply(BytesPerBlock(model, dtype), full_layer_count,
+                        "Full-attention paged cache bytes per block"),
+        auxiliary_bytes_per_block,
+        auxiliary_reserved_memory_bytes);
+  }
+
+  size_t free_bytes, total_bytes;
+  model->p_device_kvcache_->GetAvailableMemory(free_bytes, total_bytes);
+
+  if (auxiliary_reserved_memory_bytes > std::numeric_limits<size_t>::max() - windowed_bytes) {
+    throw std::overflow_error("Combined paged cache reserved memory overflows size_t");
+  }
+
+  return ComputePagedBlockCapacity(
+      free_bytes,
+      *model->config_->engine.dynamic_batching->gpu_utilization_factor,
+      windowed_bytes + auxiliary_reserved_memory_bytes,
+      model->config_->engine.dynamic_batching->block_size,
+      model->config_->model.decoder.num_key_value_heads,
+      model->config_->model.decoder.head_size,
+      full_layer_count,
+      Ort::SizeOf(dtype),
+      auxiliary_bytes_per_block);
+}
+
+size_t UsedSlots(const std::vector<std::shared_ptr<Block>>& blocks) {
+  return std::accumulate(blocks.begin(), blocks.end(), size_t{0},
+                         [](size_t sum, const std::shared_ptr<Block>& block) {
+                           return sum + block->Size();
+                         });
+}
+
+// Once the pending step completes, every token currently in the sequence has a KV slot.
+size_t RequiredSlots(const std::shared_ptr<Request>& request) {
+  return static_cast<size_t>(request->CurrentSequenceLength());
+}
+
+}  // namespace
+
+size_t ComputePagedBlockCapacity(size_t available_memory_bytes,
+                                 float gpu_utilization_factor,
+                                 size_t reserved_memory_bytes,
+                                 size_t block_size,
+                                 size_t num_key_value_heads,
+                                 size_t head_size,
+                                 size_t full_layer_count,
+                                 size_t element_size,
+                                 size_t auxiliary_bytes_per_block) {
+  if (block_size == 0 || num_key_value_heads == 0 || head_size == 0 ||
+      full_layer_count == 0 || element_size == 0) {
+    throw std::invalid_argument(
+        "Paged cache capacity dimensions must be greater than zero");
+  }
+  constexpr float memory_fragmentation_factor = 0.9f;
+  const auto budget = static_cast<size_t>(
+      available_memory_bytes * memory_fragmentation_factor * gpu_utilization_factor);
+  if (budget <= reserved_memory_bytes) {
+    throw std::runtime_error(
+        "The key-value cache budget is too small to hold the reserved decoder state.");
+  }
+
+  constexpr size_t num_caches_per_layer = 2;
+  size_t primary_bytes_per_block = block_size;
+  for (const size_t factor : {num_key_value_heads, head_size, full_layer_count,
+                              element_size, num_caches_per_layer}) {
+    if (primary_bytes_per_block > std::numeric_limits<size_t>::max() / factor) {
+      throw std::overflow_error("Paged cache bytes per block overflow size_t");
+    }
+    primary_bytes_per_block *= factor;
+  }
+  if (auxiliary_bytes_per_block >
+      std::numeric_limits<size_t>::max() - primary_bytes_per_block) {
+    throw std::overflow_error("Combined paged cache bytes per block overflow size_t");
+  }
+  return (budget - reserved_memory_bytes) /
+         (primary_bytes_per_block + auxiliary_bytes_per_block);
+}
+
+size_t ResolveConfiguredPagedBlockCount(size_t configured_num_blocks,
+                                        size_t primary_bytes_per_block,
+                                        size_t auxiliary_bytes_per_block,
+                                        size_t auxiliary_reserved_memory_bytes) {
+  if (primary_bytes_per_block == 0) {
+    throw std::invalid_argument(
+        "Paged cache primary bytes per block must be greater than zero");
+  }
+  if (auxiliary_bytes_per_block == 0 && auxiliary_reserved_memory_bytes == 0) {
+    return configured_num_blocks;
+  }
+  if (configured_num_blocks >
+      std::numeric_limits<size_t>::max() / primary_bytes_per_block) {
+    throw std::runtime_error(
+        "engine.dynamic_batching.num_blocks is too large for the paged key-value cache.");
+  }
+  const size_t budget = configured_num_blocks * primary_bytes_per_block;
+  if (budget <= auxiliary_reserved_memory_bytes) {
+    throw std::runtime_error(
+        "engine.dynamic_batching.num_blocks is too small to hold the reserved auxiliary cache.");
+  }
+  if (auxiliary_bytes_per_block >
+      std::numeric_limits<size_t>::max() - primary_bytes_per_block) {
+    throw std::runtime_error("Combined paged cache bytes per block overflow size_t.");
+  }
+  const size_t blocks =
+      (budget - auxiliary_reserved_memory_bytes) /
+      (primary_bytes_per_block + auxiliary_bytes_per_block);
+  if (blocks == 0) {
+    throw std::runtime_error(
+        "engine.dynamic_batching.num_blocks is too small to hold both the target and the "
+        "auxiliary key-value caches.");
+  }
+  return blocks;
+}
+
+size_t PagedKeyValueCacheBytesPerBlock(const std::shared_ptr<Model>& model) {
+  const auto paged_group = ResolvePagedKeyValueGroup(model->config_->model.decoder);
+  const auto dtype = KeyValueCacheType(model, paged_group);
+  const auto windowed = WindowedLayers(model, paged_group);
+  const size_t full_layer_count = paged_group.layer_ids.size() - windowed.size();
+  return CheckedMultiply(full_layer_count, BytesPerBlock(model, dtype),
+                         "Full-attention paged cache bytes per block");
+}
+
+PagedKeyValueCache::PagedKeyValueCache(std::shared_ptr<Model> model,
+                                       size_t auxiliary_bytes_per_block,
+                                       size_t auxiliary_reserved_memory_bytes)
+    : model_(model) {
+  const auto& decoder = model->config_->model.decoder;
+  const size_t block_size = model->config_->engine.dynamic_batching->block_size;
+  const size_t max_batch_size = model->config_->engine.dynamic_batching->max_batch_size;
+  const auto paged_group = ResolvePagedKeyValueGroup(decoder);
+  const auto dtype = KeyValueCacheType(model_, paged_group);
+
+  const auto windowed = WindowedLayers(model, paged_group);
+  size_t num_window_blocks = 0;
+  if (!windowed.empty()) {
+    if (decoder.sliding_window->window_size <= 0) {
+      throw std::runtime_error("Sliding-window size must be greater than zero.");
+    }
+    window_size_ = static_cast<size_t>(decoder.sliding_window->window_size);
+
+    // A step covers positions [past, past + scheduled) and each of those queries reaches back
+    // window_size positions, so the ring has to hold scheduled + window_size - 1 positions at
+    // once. `scheduled` is bounded by the prefill chunk size, which therefore has to be set: an
+    // unchunked prefill would need a ring as long as the prompt and there would be nothing to save.
+    const auto& chunk_size = model->config_->search.chunk_size;
+    if (!chunk_size.has_value() || *chunk_size == 0) {
+      throw std::runtime_error(
+          "This model holds its sliding-window layers in a ring of blocks, which only works if the "
+          "prefill is chunked. Set search.chunk_size in genai_config.json.");
+    }
+
+    window_live_span_ = WindowLiveSpan(*chunk_size, window_size_);
+    window_ring_blocks_ = WindowRingBlocks(*chunk_size, window_size_, block_size);
+    num_window_blocks = CheckedMultiply(window_ring_blocks_, max_batch_size,
+                                        "Windowed paged cache block count");
+  }
+
+  const size_t num_full_layers = paged_group.layer_ids.size() - windowed.size();
+  if (num_full_layers == 0) {
+    throw std::runtime_error("A paged model needs at least one layer that keeps the whole sequence.");
+  }
+  const size_t windowed_bytes = CheckedMultiply(
+      CheckedMultiply(num_window_blocks, windowed.size(),
+                      "Windowed paged cache allocation"),
+      BytesPerBlock(model, dtype), "Windowed paged cache allocation");
+  const auto num_blocks = ComputeNumBlocks(model_, num_full_layers,
+                                           windowed_bytes,
+                                           dtype,
+                                           auxiliary_bytes_per_block,
+                                           auxiliary_reserved_memory_bytes);
+
+  for (const int layer_id : paged_group.layer_ids) {
+    const auto blocks = windowed.count(layer_id) != 0 ? num_window_blocks : num_blocks;
+    const std::vector<int64_t> cache_shape_per_layer{static_cast<int64_t>(blocks),
+                                                     static_cast<int64_t>(block_size),
+                                                     static_cast<int64_t>(decoder.num_key_value_heads),
+                                                     static_cast<int64_t>(decoder.head_size)};
+    cache_.push_back(LayerCache{
+        OrtValue::CreateTensor(model->p_device_kvcache_->GetAllocator(), cache_shape_per_layer, dtype),  // Key cache
+        OrtValue::CreateTensor(model->p_device_kvcache_->GetAllocator(), cache_shape_per_layer, dtype),  // Value cache
+        ComposeKeyValueName(decoder.inputs.past_key_names, layer_id),
+        ComposeKeyValueName(decoder.inputs.past_value_names, layer_id),
+        ComposeKeyValueName(decoder.outputs.present_key_names, layer_id),
+        ComposeKeyValueName(decoder.outputs.present_value_names, layer_id)});
+  }
+  block_pool_ = std::make_unique<BlockPool>(block_size, num_blocks);
+  if (Windowed()) {
+    window_block_pool_ = std::make_unique<BlockPool>(block_size, num_window_blocks);
+  }
+
+  max_batch_size_ = max_batch_size;
+  block_table_index_ = std::make_unique<RequestIndex>(max_batch_size_);
+  graph_capture_ = IsGraphCaptureEnabled(decoder.session_options);
+  if (graph_capture_) {
+    max_block_table_rows_ = max_batch_size_;
+    // A sequence can never need more blocks than the model's context window, and it can never use
+    // more than the pool holds. The buffer is allocated once at that ceiling; individual steps view
+    // a smaller [rows, columns] window of it.
+    max_block_table_columns_ = std::min<size_t>(
+        (static_cast<size_t>(model->config_->model.context_length) + block_size - 1) / block_size,
+        num_blocks);
+    max_block_table_columns_ = std::max<size_t>(max_block_table_columns_, 1);
+    block_tables_tensor_ = std::make_unique<Tensor>(model->p_device_inputs_, Ort::TypeToTensorType<int32_t>);
+    block_tables_tensor_->CreateTensor(
+        std::vector<int64_t>{static_cast<int64_t>(max_block_table_rows_),
+                             static_cast<int64_t>(max_block_table_columns_)},
+        /*make_static=*/true);
+    if (Windowed()) {
+      // Same shape as the full table: the operator indexes both with the token's true position,
+      // only the ids repeat, so the two tables also share a capture bucket.
+      window_block_tables_tensor_ = std::make_unique<Tensor>(model->p_device_inputs_, Ort::TypeToTensorType<int32_t>);
+      window_block_tables_tensor_->CreateTensor(
+          std::vector<int64_t>{static_cast<int64_t>(max_block_table_rows_),
+                               static_cast<int64_t>(max_block_table_columns_)},
+          /*make_static=*/true);
+    }
+  }
+}
+
+bool PagedKeyValueCache::CanAdd(std::shared_ptr<Request> request) const {
+  if (block_pool_->AvailableBlocks() < block_pool_->BlocksNeeded(RequiredSlots(request))) {
+    return false;
+  }
+  // The ring is a fixed cost per request, so admission is the only place it can fail.
+  return !Windowed() || window_block_pool_->AvailableBlocks() >= window_ring_blocks_;
+}
+
+void PagedKeyValueCache::Add(std::shared_ptr<Request> request) {
+  if (!CanAdd(request)) {
+    throw std::runtime_error("Not enough free blocks available to serve the request.");
+  }
+  if (block_table_index_->Find(request.get()) ||
+      block_table_index_->Size() >= block_table_index_->Capacity()) {
+    throw std::logic_error(
+        "Paged cache request index cannot admit this request.");
+  }
+
+  // Reserve the blocks the prompt will need, but leave their slots empty. The slots are marked
+  // used in AppendTokens() once the tokens are actually written to the cache. Marking them here
+  // too would count the prompt twice and force the pool to be sized at roughly twice the
+  // capacity it can actually use.
+  auto reserved_blocks = block_pool_->ReserveBlocks(RequiredSlots(request));
+
+  // The ring, in contrast, is claimed in full up front. Its slots are written over and over as the
+  // window slides, so there is nothing to grow later and no meaningful notion of a used slot.
+  std::vector<std::shared_ptr<Block>> window_blocks;
+  if (Windowed()) {
+    window_blocks = window_block_pool_->AllocateBlocks(window_ring_blocks_ * window_block_pool_->BlockSize());
+  }
+
+  block_tables_.emplace_back(
+      PagedCacheBlockTable{request.get(), 0, std::move(reserved_blocks), std::move(window_blocks)});
+  if (!block_table_index_->Insert(
+          request.get(), block_tables_.size() - 1)) {
+    std::terminate();
+  }
+}
+
+bool PagedKeyValueCache::CanAppendTokens(std::shared_ptr<Request> request) const {
+  const auto block_table_it = std::find_if(block_tables_.begin(), block_tables_.end(),
+                                           [&request](const PagedCacheBlockTable& block_table) {
+                                             return block_table.request_id_ == request.get();
+                                           });
+  if (block_table_it == block_tables_.end()) {
+    throw std::runtime_error("Given request is not found in the cache.");
+  }
+
+  const size_t required_slots = RequiredSlots(request);
+  const size_t used_slots = block_table_it->committed_slots_;
+  if (required_slots <= used_slots) {
+    return true;
+  }
+
+  const size_t num_slots_available =
+      block_table_it->blocks_.size() * block_pool_->BlockSize() - used_slots +
+      block_pool_->AvailableBlocks() * block_pool_->BlockSize();
+
+  return num_slots_available >= required_slots - used_slots;
+}
+
+void PagedKeyValueCache::AppendTokens(std::shared_ptr<Request> request) {
+  if (!CanAppendTokens(request)) {
+    throw std::runtime_error("Not enough free slots available to append tokens to the request.");
+  }
+
+  if (Windowed() && WindowLiveSpan(request->UnprocessedTokens().size(), window_size_) > window_live_span_) {
+    // More tokens in one step than the ring was sized for, so the oldest positions this step still
+    // has to attend to would be overwritten by the newest ones before they are read.
+    throw std::runtime_error(
+        "A step carries more tokens than the sliding-window ring can hold together with the window. "
+        "Lower search.chunk_size, or rebuild the model with a larger one.");
+  }
+
+  const auto block_table_it = std::find_if(block_tables_.begin(), block_tables_.end(),
+                                           [&request](const PagedCacheBlockTable& block_table) {
+                                             return block_table.request_id_ == request.get();
+                                           });
+  assert(block_table_it != block_tables_.end());
+
+  const size_t required_slots = RequiredSlots(request);
+  const size_t used_slots = block_table_it->committed_slots_;
+  assert(UsedSlots(block_table_it->blocks_) == used_slots);
+  assert(used_slots == static_cast<size_t>(request->ProcessedSequenceLength()));
+  if (required_slots <= used_slots) {
+    return;
+  }
+  const size_t growth = required_slots - used_slots;
+  const size_t committed_capacity =
+      block_table_it->blocks_.size() * block_pool_->BlockSize();
+  const size_t tail_capacity = committed_capacity - used_slots;
+  const size_t new_slots = growth > tail_capacity ? growth - tail_capacity : 0;
+  const size_t new_block_count = block_pool_->BlocksNeeded(new_slots);
+
+  // Complete every fallible allocation before changing existing block occupancy.
+  block_table_it->blocks_.reserve(
+      block_table_it->blocks_.size() + new_block_count);
+  auto allocated_blocks = block_pool_->AllocateBlocks(new_slots);
+
+  size_t num_slots = growth - new_slots;
+  size_t block_index = used_slots / block_pool_->BlockSize();
+  while (num_slots > 0 && block_index < block_table_it->blocks_.size()) {
+    auto& block = block_table_it->blocks_[block_index++];
+    const size_t slots = std::min(num_slots, block->EmptySlots());
+    block->AddSlots(slots);
+    num_slots -= slots;
+  }
+  std::move(allocated_blocks.begin(), allocated_blocks.end(),
+            std::back_inserter(block_table_it->blocks_));
+  block_table_it->committed_slots_ = required_slots;
+  ++block_table_it->mutation_generation_;
+  block_pool_->RecordOccupancyMutation();
+}
+
+void PagedKeyValueCache::Remove(std::shared_ptr<Request> request) {
+  RemovePagedCacheBlockTable(*block_pool_, window_block_pool_.get(),
+                             block_tables_, request.get());
+  RebuildBlockTableIndex();
+}
+
+void PagedKeyValueCache::ValidateRemove(const void* request_id) const {
+  ValidateRemovePagedCacheBlockTable(
+      *block_pool_, window_block_pool_.get(), block_tables_, request_id);
+}
+
+void PagedKeyValueCache::RemoveValidated(const void* request_id) noexcept {
+  RemoveValidatedPagedCacheBlockTable(
+      *block_pool_, window_block_pool_.get(), block_tables_, request_id);
+  RebuildBlockTableIndex();
+}
+
+bool PagedKeyValueCache::OwnsRequest(
+    const void* request_id) const noexcept {
+  const auto index = block_table_index_->Find(request_id);
+  return index && *index < block_tables_.size() &&
+         block_tables_[*index].request_id_ == request_id;
+}
+
+size_t PagedKeyValueCache::CommittedSlots(
+    const void* request_id) const {
+  const auto index = block_table_index_->Find(request_id);
+  if (!index || *index >= block_tables_.size() ||
+      block_tables_[*index].request_id_ != request_id) {
+    throw StepPlanningConsistencyError(
+        "A cache resident has no committed paged cache table.");
+  }
+  return block_tables_[*index].committed_slots_;
+}
+
+PagedCacheReservation PagedKeyValueCache::Reserve(std::span<const PagedCacheReservationRequest> requests) {
+  return PagedCacheReservation{*block_pool_, block_tables_, requests,
+                               window_block_pool_.get(), window_ring_blocks_,
+                               block_table_index_.get()};
+}
+
+void PagedKeyValueCache::RebuildBlockTableIndex() noexcept {
+  block_table_index_->Clear();
+  for (size_t index = 0; index < block_tables_.size(); ++index) {
+    if (!block_table_index_->Insert(
+            block_tables_[index].request_id_, index)) {
+      std::terminate();
+    }
+  }
+}
+
+StepPlanningResult PagedKeyValueCache::PlanStepResources(StepPlan& plan) const {
+  const size_t committed_request_count = block_tables_.size();
+  if (committed_request_count > max_batch_size_) {
+    throw StepPlanningConsistencyError(
+        "Committed paged cache requests exceed the configured batch size.");
+  }
+  const size_t scheduled_request_limit =
+      plan.scheduled_request_limit == 0
+          ? max_batch_size_
+          : plan.scheduled_request_limit;
+  if (scheduled_request_limit > max_batch_size_) {
+    throw StepPlanningConsistencyError(
+        "Step plan request limit exceeds the configured batch size.");
+  }
+
+  const size_t available_blocks = block_pool_->AvailableBlocks();
+  const size_t available_window_blocks =
+      Windowed() ? window_block_pool_->AvailableBlocks() : 0;
+  size_t planned_blocks = 0;
+  size_t selected_requests = 0;
+  size_t selected_new_requests = 0;
+  size_t max_blocks_per_request = 0;
+  bool capacity_deferred = false;
+  const void* unserviceable_request_id = nullptr;
+
+  struct CacheGrowth {
+    size_t proposed_blocks{};
+    size_t new_blocks{};
+  };
+  // Blocks the request has to own for this step. A chunked prefill is planned one chunk at a time,
+  // but the blocks are taken for the whole sequence: admitting a prompt on the strength of its
+  // first chunk and then losing the rest of the pool to another request would stall it part way
+  // through, holding the blocks it already took. PagedCacheReservation reserves the same blocks.
+  const auto calculate_growth = [&](const RequestStepPlan& entry,
+                                    const PagedCacheBlockTable* table) {
+    const size_t committed_slots = table ? table->committed_slots_ : 0;
+    if (entry.target_cache_slots < committed_slots) {
+      throw StepPlanningConsistencyError(
+          "Step plan target precedes the committed cache boundary.");
+    }
+
+    const size_t reserved_slots =
+        std::max(entry.whole_sequence_cache_slots, entry.target_cache_slots);
+    const size_t committed_blocks = table ? table->blocks_.size() : 0;
+    const size_t committed_capacity = committed_blocks * block_pool_->BlockSize();
+    const size_t additional_slots =
+        reserved_slots > committed_capacity ? reserved_slots - committed_capacity : 0;
+    const size_t new_blocks = block_pool_->BlocksNeeded(additional_slots);
+    return CacheGrowth{committed_blocks + new_blocks, new_blocks};
+  };
+  const auto permanently_unserviceable = [&](const CacheGrowth& growth) {
+    return growth.proposed_blocks > block_pool_->Capacity() ||
+           (graph_capture_ &&
+            growth.proposed_blocks > max_block_table_columns_);
+  };
+  const auto select = [&](size_t request_index,
+                          const CacheGrowth& growth) {
+    // Compact selected entries in place. Requests skipped for temporary capacity pressure remain
+    // pending with their committed block tables untouched and can be reconsidered next Run().
+    planned_blocks += growth.new_blocks;
+    max_blocks_per_request =
+        std::max(max_blocks_per_request, growth.proposed_blocks);
+    if (selected_requests != request_index) {
+      plan.requests[selected_requests] =
+          std::move(plan.requests[request_index]);
+    }
+    ++selected_requests;
+  };
+  const auto find_table = [this](const void* request_id) {
+    const auto index = block_table_index_->Find(request_id);
+    return index ? &block_tables_[*index] : nullptr;
+  };
+  RequestIndex request_ids{plan.requests.size()};
+  for (size_t i = 0; i < plan.requests.size(); ++i) {
+    const auto& candidate = plan.requests[i];
+    if (!request_ids.Insert(candidate.request_id, i)) {
+      throw StepPlanningConsistencyError(
+          "Step plan contains a duplicate request.");
+    }
+
+    const auto* table = find_table(candidate.request_id);
+    if (candidate.newly_admitted && table) {
+      throw StepPlanningConsistencyError(
+          "New step plan request already belongs to the paged cache.");
+    }
+    if (!candidate.newly_admitted && !table) {
+      throw StepPlanningConsistencyError(
+          "Step plan resident membership does not match the committed cache.");
+    }
+
+    const auto growth = calculate_growth(candidate, table);
+    if (permanently_unserviceable(growth)) {
+      if (!unserviceable_request_id) {
+        unserviceable_request_id = candidate.request_id;
+      }
+      continue;
+    }
+
+    if (selected_requests >= scheduled_request_limit ||
+        (candidate.newly_admitted &&
+         (committed_request_count + selected_new_requests >= max_batch_size_ ||
+          (Windowed() &&
+           (selected_new_requests + 1) * window_ring_blocks_ > available_window_blocks))) ||
+        planned_blocks + growth.new_blocks > available_blocks) {
+      capacity_deferred = true;
+      continue;
+    }
+
+    const bool newly_admitted = candidate.newly_admitted;
+    select(i, growth);
+    if (newly_admitted) {
+      ++selected_new_requests;
+    }
+  }
+  plan.requests.resize(selected_requests);
+
+  size_t block_table_columns = max_blocks_per_request;
+  if (graph_capture_) {
+    block_table_columns =
+        GetGraphBlockTableColumns(max_blocks_per_request, max_block_table_columns_);
+  }
+
+  plan.proposed_block_table_columns = block_table_columns;
+
+  if (!plan.requests.empty()) {
+    return StepPlanningResult{
+        true,
+        capacity_deferred,
+        unserviceable_request_id,
+        {StepOutcomeKind::Committed, plan.transaction_id, nullptr},
+    };
+  }
+  if (unserviceable_request_id) {
+    return StepPlanningResult{
+        false,
+        capacity_deferred,
+        unserviceable_request_id,
+        {StepOutcomeKind::UnserviceableRequest, plan.transaction_id, unserviceable_request_id},
+    };
+  }
+  if (capacity_deferred) {
+    return StepPlanningResult{
+        false,
+        true,
+        nullptr,
+        {StepOutcomeKind::CapacityDeferred, plan.transaction_id, nullptr},
+    };
+  }
+  return StepPlanningResult{
+      false,
+      false,
+      nullptr,
+      {StepOutcomeKind::NoWork, plan.transaction_id, nullptr},
+  };
+}
+
+PagedCacheSnapshot PagedKeyValueCache::Snapshot() const {
+  PagedCacheSnapshot snapshot;
+  snapshot.block_size = block_pool_->BlockSize();
+  snapshot.total_blocks = block_pool_->Capacity();
+  snapshot.free_blocks = block_pool_->AvailableBlocks();
+  snapshot.block_table_columns = block_table_columns_;
+  snapshot.requests.reserve(block_tables_.size());
+  for (const auto& block_table : block_tables_) {
+    RequestBlockSnapshot request_snapshot;
+    request_snapshot.request_id = block_table.request_id_;
+    request_snapshot.block_ids.reserve(block_table.blocks_.size());
+    for (const auto& block : block_table.blocks_) {
+      request_snapshot.block_ids.push_back(block->Id());
+      request_snapshot.used_slots += block->Size();
+      request_snapshot.empty_slots += block->EmptySlots();
+    }
+    snapshot.requests.push_back(std::move(request_snapshot));
+  }
+  if (Windowed()) {
+    snapshot.window_blocks.total_blocks = window_block_pool_->Capacity();
+    snapshot.window_blocks.free_blocks = window_block_pool_->AvailableBlocks();
+    snapshot.window_blocks.blocks_per_request = window_ring_blocks_;
+    snapshot.window_blocks.requests.reserve(block_tables_.size());
+    for (const auto& block_table : block_tables_) {
+      RequestBlockSnapshot request_snapshot;
+      request_snapshot.request_id = block_table.request_id_;
+      request_snapshot.block_ids.reserve(block_table.window_blocks_.size());
+      for (const auto& block : block_table.window_blocks_) {
+        request_snapshot.block_ids.push_back(block->Id());
+      }
+      snapshot.window_blocks.requests.push_back(std::move(request_snapshot));
+    }
+  }
+  return snapshot;
+}
+
+PagedCacheSnapshot PagedKeyValueCache::Snapshot(
+    const PagedCacheReservation& reservation) const {
+  auto snapshot = Snapshot();
+  snapshot.transaction_reserved_block_ids.reserve(
+      reservation.ReservedBlocks().size());
+  for (const auto& block : reservation.ReservedBlocks()) {
+    snapshot.transaction_reserved_block_ids.push_back(block->Id());
+  }
+  snapshot.window_blocks.transaction_reserved_block_ids.reserve(
+      reservation.ReservedWindowBlocks().size());
+  for (const auto& block : reservation.ReservedWindowBlocks()) {
+    snapshot.window_blocks.transaction_reserved_block_ids.push_back(block->Id());
+  }
+  snapshot.reservations.reserve(reservation.Deltas().size());
+  for (const auto& delta : reservation.Deltas()) {
+    RequestReservationSnapshot request_reservation;
+    request_reservation.request_id = delta.request_id;
+    request_reservation.committed_slots = delta.committed_slots;
+    request_reservation.target_slots = delta.target_slots;
+    request_reservation.reserved_block_ids.reserve(
+        delta.reserved_block_count);
+    for (size_t i = 0; i < delta.reserved_block_count; ++i) {
+      request_reservation.reserved_block_ids.push_back(
+          reservation.ReservedBlocks()[delta.reserved_block_offset + i]->Id());
+    }
+    snapshot.reservations.push_back(std::move(request_reservation));
+  }
+  return snapshot;
+}
+
+std::vector<std::pair<OrtValue*, OrtValue*>> PagedKeyValueCache::Cache() {
+  std::vector<std::pair<OrtValue*, OrtValue*>> cache;
+  for (auto& layer_cache : cache_) {
+    cache.emplace_back(layer_cache.key_cache.get(), layer_cache.value_cache.get());
+  }
+  return cache;
+}
+
+std::vector<std::pair<const char*, const char*>> PagedKeyValueCache::Names() {
+  std::vector<std::pair<const char*, const char*>> names;
+  for (const auto& layer_cache : cache_) {
+    names.emplace_back(layer_cache.key_cache_name.c_str(), layer_cache.value_cache_name.c_str());
+  }
+  return names;
+}
+
+std::vector<std::pair<const char*, const char*>> PagedKeyValueCache::OutputNames() {
+  std::vector<std::pair<const char*, const char*>> output_names;
+  for (const auto& layer_cache : cache_) {
+    output_names.emplace_back(layer_cache.key_cache_output_name.c_str(), layer_cache.value_cache_output_name.c_str());
+  }
+  return output_names;
+}
+
+void PagedKeyValueCache::FillBlockTables(const std::vector<std::shared_ptr<Request>>& requests,
+                                         bool windowed, int32_t* data, size_t columns) {
+  constexpr int32_t block_tables_pad_value = -1;
+
+  for (auto& block_table : block_tables_) {
+    auto it = std::find_if(requests.begin(), requests.end(),
+                           [&block_table](const std::shared_ptr<Request>& request) {
+                             return request.get() == block_table.request_id_;
+                           });
+    if (it == requests.end()) {
+      throw std::runtime_error("Given request is not found in the cache. Please add it before requesting block tables.");
+    }
+    size_t index = std::distance(requests.begin(), it);
+
+    if (windowed) {
+      // Repeat the ring across every column. There is nothing to pad: whichever column the
+      // operator reaches for, the ring block it names is the one holding that position.
+      for (size_t j = 0; j < columns; ++j) {
+        const auto& block = block_table.window_blocks_[WindowRingColumn(j, window_ring_blocks_)];
+        data[index * columns + j] = static_cast<int32_t>(block->Id());
+      }
+      continue;
+    }
+
+    for (size_t j = 0; j < block_table.blocks_.size(); ++j) {
+      data[index * columns + j] = static_cast<int32_t>(block_table.blocks_[j]->Id());
+    }
+    for (size_t j = block_table.blocks_.size(); j < columns; ++j) {
+      data[index * columns + j] = block_tables_pad_value;
+    }
+  }
+}
+
+std::pair<OrtValue*, const char*> PagedKeyValueCache::BlockTables(const std::vector<std::shared_ptr<Request>>& requests) {
+  size_t max_blocks = 0;
+  for (auto& block_table : block_tables_) {
+    if (std::find_if(requests.begin(), requests.end(),
+                     [&block_table](const std::shared_ptr<Request>& request) {
+                       return request.get() == block_table.request_id_;
+                     }) != requests.end()) {
+      max_blocks = std::max(max_blocks, block_table.blocks_.size());
+    } else {
+      throw std::runtime_error("Given request is not found in the cache. Please add it before requesting block tables.");
+    }
+  }
+
+  std::vector<int64_t> shape = {static_cast<int64_t>(requests.size()), static_cast<int64_t>(max_blocks)};
+  int32_t* block_table_data = nullptr;
+  DeviceSpan<int32_t> device_span;
+  if (graph_capture_) {
+    // Round the column count up to a power of two so that a run producing steadily longer sequences
+    // settles on a handful of distinct shapes instead of a new one every time a block is appended.
+    // Each distinct shape is captured under its own annotation id.
+    block_table_columns_ =
+        GetGraphBlockTableColumns(max_blocks, max_block_table_columns_);
+    if (max_blocks > block_table_columns_ || requests.size() > max_block_table_rows_) {
+      throw std::runtime_error("Block table exceeds the capacity reserved for graph capture.");
+    }
+    max_blocks = block_table_columns_;
+    shape[1] = static_cast<int64_t>(max_blocks);
+    // Re-creating the view keeps the same underlying buffer, so the address baked into a captured
+    // graph stays valid while the shape tracks the current bucket.
+    block_tables_tensor_->CreateTensor(shape, /*make_static=*/true);
+    device_span = block_tables_tensor_->GetDeviceSpan<int32_t>();
+    block_table_data = device_span.CpuSpan().data();
+  } else {
+    block_table_columns_ = max_blocks;
+    block_tables_value_ = OrtValue::CreateTensor(model_->allocator_cpu_, shape, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32);
+    block_table_data = block_tables_value_->GetTensorMutableData<int32_t>();
+  }
+
+  FillBlockTables(requests, /*windowed=*/false, block_table_data, max_blocks);
+
+  if (graph_capture_) {
+    device_span.CopyCpuToDevice();
+    return {block_tables_tensor_->GetOrtTensor(), model_->config_->model.decoder.inputs.block_table.c_str()};
+  }
+
+  return {block_tables_value_.get(), model_->config_->model.decoder.inputs.block_table.c_str()};
+}
+
+std::pair<OrtValue*, const char*> PagedKeyValueCache::BlockTables(
+    const std::vector<std::shared_ptr<Request>>& requests,
+    const PagedCacheReservation& reservation,
+    size_t columns) {
+  if (columns < reservation.RequiredBlockTableColumns()) {
+    throw std::runtime_error("Proposed block table is narrower than the cache reservation.");
+  }
+
+  std::vector<int64_t> shape{
+      static_cast<int64_t>(requests.size()),
+      static_cast<int64_t>(columns),
+  };
+  int32_t* block_table_data = nullptr;
+  DeviceSpan<int32_t> device_span;
+  if (graph_capture_) {
+    if (columns > max_block_table_columns_ ||
+        requests.size() > max_block_table_rows_) {
+      throw std::runtime_error("Proposed block table exceeds the graph capture buffer.");
+    }
+    block_tables_tensor_->CreateTensor(shape, /*make_static=*/true);
+    device_span = block_tables_tensor_->GetDeviceSpan<int32_t>();
+    block_table_data = device_span.CpuSpan().data();
+  } else {
+    block_tables_value_ =
+        OrtValue::CreateTensor(model_->allocator_cpu_, shape,
+                               ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32);
+    block_table_data = block_tables_value_->GetTensorMutableData<int32_t>();
+  }
+
+  std::vector<const void*> request_ids;
+  request_ids.reserve(requests.size());
+  for (const auto& request : requests) {
+    request_ids.push_back(request.get());
+  }
+  reservation.FillBlockTable(
+      request_ids,
+      columns,
+      std::span<int32_t>{block_table_data, requests.size() * columns});
+  block_table_columns_ = columns;
+
+  if (graph_capture_) {
+    device_span.CopyCpuToDevice();
+    return {block_tables_tensor_->GetOrtTensor(),
+            model_->config_->model.decoder.inputs.block_table.c_str()};
+  }
+  return {block_tables_value_.get(),
+          model_->config_->model.decoder.inputs.block_table.c_str()};
+}
+
+std::pair<OrtValue*, const char*> PagedKeyValueCache::WindowBlockTables(const std::vector<std::shared_ptr<Request>>& requests) {
+  // Must run after BlockTables(), which is what settles the column count for this step. Both
+  // tables carry the same columns so that a position resolves through the same index in each.
+  const size_t columns = block_table_columns_;
+  const std::vector<int64_t> shape = {static_cast<int64_t>(requests.size()), static_cast<int64_t>(columns)};
+
+  int32_t* data = nullptr;
+  DeviceSpan<int32_t> device_span;
+  if (graph_capture_) {
+    window_block_tables_tensor_->CreateTensor(shape, /*make_static=*/true);
+    device_span = window_block_tables_tensor_->GetDeviceSpan<int32_t>();
+    data = device_span.CpuSpan().data();
+  } else {
+    window_block_tables_value_ = OrtValue::CreateTensor(model_->allocator_cpu_, shape, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32);
+    data = window_block_tables_value_->GetTensorMutableData<int32_t>();
+  }
+
+  FillBlockTables(requests, /*windowed=*/true, data, columns);
+
+  if (graph_capture_) {
+    device_span.CopyCpuToDevice();
+    return {window_block_tables_tensor_->GetOrtTensor(), model_->config_->model.decoder.inputs.block_table_windowed.c_str()};
+  }
+
+  return {window_block_tables_value_.get(), model_->config_->model.decoder.inputs.block_table_windowed.c_str()};
+}
+
+std::pair<OrtValue*, const char*> PagedKeyValueCache::WindowBlockTables(
+    const std::vector<std::shared_ptr<Request>>& requests,
+    const PagedCacheReservation& reservation,
+    size_t columns) {
+  const std::vector<int64_t> shape = {static_cast<int64_t>(requests.size()),
+                                      static_cast<int64_t>(columns)};
+  int32_t* data = nullptr;
+  DeviceSpan<int32_t> device_span;
+  if (graph_capture_) {
+    window_block_tables_tensor_->CreateTensor(shape, /*make_static=*/true);
+    device_span = window_block_tables_tensor_->GetDeviceSpan<int32_t>();
+    data = device_span.CpuSpan().data();
+  } else {
+    window_block_tables_value_ = OrtValue::CreateTensor(
+        model_->allocator_cpu_, shape, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32);
+    data = window_block_tables_value_->GetTensorMutableData<int32_t>();
+  }
+
+  std::vector<const void*> request_ids;
+  request_ids.reserve(requests.size());
+  for (const auto& request : requests) {
+    request_ids.push_back(request.get());
+  }
+  reservation.FillWindowBlockTable(
+      request_ids, columns,
+      std::span<int32_t>{data, requests.size() * columns});
+
+  if (graph_capture_) {
+    device_span.CopyCpuToDevice();
+    return {window_block_tables_tensor_->GetOrtTensor(),
+            model_->config_->model.decoder.inputs.block_table_windowed.c_str()};
+  }
+  return {window_block_tables_value_.get(),
+          model_->config_->model.decoder.inputs.block_table_windowed.c_str()};
+}
+
+void PagedKeyValueCache::BindCache(State& state) {
+  auto cache = Cache();
+  auto cache_names = Names();
+  auto cache_output_names = OutputNames();
+
+  const size_t num_block_tables = Windowed() ? 2 : 1;
+  if (state.inputs_.empty()) {
+    // Number of layers * 2 for key and value caches + one entry per block table
+    state.inputs_.resize(cache.size() * 2 + num_block_tables);
+    state.input_names_.resize(cache.size() * 2 + num_block_tables);
+    state.outputs_.resize(cache.size() * 2);
+    state.output_names_.resize(cache.size() * 2);
+  }
+
+  for (size_t layer_idx = 0; layer_idx < cache.size(); ++layer_idx) {
+    // Key cache
+    state.inputs_[layer_idx * 2] = cache[layer_idx].first;
+    state.outputs_[layer_idx * 2] = cache[layer_idx].first;
+
+    // Key cache name
+    state.input_names_[layer_idx * 2] = cache_names[layer_idx].first;
+    state.output_names_[layer_idx * 2] = cache_output_names[layer_idx].first;
+
+    // Value cache
+    state.inputs_[layer_idx * 2 + 1] = cache[layer_idx].second;
+    state.outputs_[layer_idx * 2 + 1] = cache[layer_idx].second;
+
+    // Value cache name
+    state.input_names_[layer_idx * 2 + 1] = cache_names[layer_idx].second;
+    state.output_names_[layer_idx * 2 + 1] = cache_output_names[layer_idx].second;
+  }
+}
+
+void PagedKeyValueCache::UpdateState(State& state, const std::vector<std::shared_ptr<Request>>& requests) {
+  BindCache(state);
+  auto block_tables = BlockTables(requests);
+  state.inputs_[cache_.size() * 2] = block_tables.first;
+  state.input_names_[cache_.size() * 2] = block_tables.second;
+
+  if (Windowed()) {
+    // Depends on the column count BlockTables() just settled, so it has to follow it.
+    auto window_block_tables = WindowBlockTables(requests);
+    state.inputs_[cache_.size() * 2 + 1] = window_block_tables.first;
+    state.input_names_[cache_.size() * 2 + 1] = window_block_tables.second;
+  }
+}
+
+void PagedKeyValueCache::UpdateState(
+    State& state,
+    const std::vector<std::shared_ptr<Request>>& requests,
+    const PagedCacheReservation& reservation,
+    size_t columns) {
+  BindCache(state);
+  auto block_tables = BlockTables(requests, reservation, columns);
+  const size_t block_table_index = cache_.size() * 2;
+  state.inputs_[block_table_index] = block_tables.first;
+  state.input_names_[block_table_index] = block_tables.second;
+  if (Windowed()) {
+    auto window_block_tables = WindowBlockTables(requests, reservation, columns);
+    state.inputs_[block_table_index + 1] = window_block_tables.first;
+    state.input_names_[block_table_index + 1] = window_block_tables.second;
+  }
+}
+
+}  // namespace Generators
+
+===== FILE: src\engine\cache_manager.cpp =====
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+#include "cache_manager.h"
+
+#include <algorithm>
+#include <exception>
+#include <optional>
+#include <stdexcept>
+#include <string>
+
+#include "../models/model_state_manifest.h"
+
+namespace Generators {
+
+namespace {
+
+// One transaction reservation over both the paged KV cache and, when the model declares fixed
+// decoder-state groups, the fixed-state pool. It plans and reserves both up front, validates both
+// before publishing either, stages all fallible fixed device work into inactive banks during
+// PrepareCommit, and then publishes both at an infallible boundary.
+//
+// A composite reservation wraps exactly one PagedCacheReservation. The Engine holds at most one
+// composite reservation at a time and the fixed pool permits a single live reservation, so no two
+// paged reservations ever share the cache's committed_tables_ vector concurrently. The paged
+// reservation's constructor therefore reserves its own committed_tables_ headroom, and its
+// CommitValidated() is allocation-free even though it publishes every newly admitted table in one
+// call. This is why no cross-reservation aggregate capacity preflight is needed here.
+class CompositeCacheStepReservation final : public CacheStepReservation {
+ public:
+  CompositeCacheStepReservation(PagedKeyValueCache& cache,
+                                FixedStatePool* fixed_state_pool,
+                                std::vector<std::shared_ptr<Request>>& allocated_requests,
+                                const StepPlan& plan)
+      : allocated_requests_{allocated_requests} {
+    std::vector<PagedCacheReservationRequest> paged_requests;
+    paged_requests.reserve(plan.requests.size());
+    std::vector<FixedStateReservationRequest> fixed_requests;
+    if (fixed_state_pool) {
+      fixed_requests.reserve(plan.requests.size());
+    }
+    newly_admitted_.reserve(plan.requests.size());
+    for (const auto& entry : plan.requests) {
+      paged_requests.push_back(PagedCacheReservationRequest{
+          entry.request_id,
+          entry.target_cache_slots,
+          entry.newly_admitted,
+          entry.whole_sequence_cache_slots,
+      });
+      if (fixed_state_pool) {
+        // Fixed and paged track the same per-request cache-slot boundary: the fixed target_tokens
+        // mirror the paged target so both commit at one token boundary. The pool infers resident
+        // vs. new ownership itself, so no newly_admitted flag is passed.
+        fixed_requests.push_back(FixedStateReservationRequest{
+            entry.request_id,
+            entry.target_cache_slots,
+            entry.draft_token_count,
+        });
+      }
+      if (entry.newly_admitted) {
+        newly_admitted_.push_back(entry.request);
+      }
+    }
+
+    allocated_requests_.reserve(allocated_requests_.size() + newly_admitted_.size());
+    // Reserve paged blocks first, then fixed slots. If the fixed reservation throws, the already
+    // constructed paged reservation member is destroyed as the constructor unwinds, which releases
+    // its blocks, so no half-built reservation escapes.
+    paged_reservation_.emplace(cache.Reserve(paged_requests));
+    if (fixed_state_pool) {
+      fixed_reservation_.emplace(fixed_state_pool->Reserve(fixed_requests));
+    }
+  }
+
+  PagedCacheReservation* PagedReservation() override {
+    return &*paged_reservation_;
+  }
+
+  FixedStateReservation* FixedReservation() override {
+    return fixed_reservation_ ? &*fixed_reservation_ : nullptr;
+  }
+
+  std::span<const FixedStateSlotHandle> FixedStateSlots() const override {
+    return fixed_reservation_ ? fixed_reservation_->Handles()
+                              : std::span<const FixedStateSlotHandle>{};
+  }
+
+  std::span<const FixedStateBinding> FixedStateBindings() const override {
+    return fixed_reservation_ ? fixed_reservation_->Bindings()
+                              : std::span<const FixedStateBinding>{};
+  }
+
+  size_t FixedStateStagingBytes() const override {
+    return fixed_reservation_ ? fixed_reservation_->PlannedStagingBytes() : 0;
+  }
+
+  size_t FixedStateNewSlotCount() const override {
+    return fixed_reservation_ ? fixed_reservation_->NewSlotCount() : 0;
+  }
+
+  void CommitPrefix(size_t row, const void* request_id,
+                    size_t step_tokens, size_t kept_tokens) override {
+    if (prepared_ || committed_) {
+      throw std::logic_error(
+          "Composite cache step reservation no longer accepts prefix commits.");
+    }
+    // Fixed first: it is the only one of the two that can reject the request (no checkpoints, or a
+    // step longer than the checkpoint window), so the paged boundary is never lowered on its own.
+    if (fixed_reservation_) {
+      fixed_reservation_->CommitPrefix(row, step_tokens, kept_tokens);
+    }
+    paged_reservation_->CommitPrefix(request_id, step_tokens, kept_tokens);
+  }
+
+  void ValidateCommit() const override {
+    if (committed_) {
+      throw std::logic_error(
+          "Composite cache step reservation can only be committed once.");
+    }
+    // Validate both sub-reservations up front so neither is published if either cannot commit.
+    if (fixed_reservation_) {
+      fixed_reservation_->ValidateCommit();
+    }
+    paged_reservation_->ValidateCommit();
+  }
+
+  void PrepareCommit() override {
+    if (prepared_) {
+      throw std::logic_error(
+          "Composite cache step reservation can only be prepared once.");
+    }
+    ValidateCommit();
+    // All fallible device work runs here, staging fixed outputs into the pool's inactive banks. The
+    // visible fixed state and committed paged tables are untouched, so a failure leaves committed
+    // state intact even though the Engine treats it as fatal (inactive banks may be partly written).
+    if (fixed_reservation_) {
+      fixed_reservation_->PrepareCommit();
+    }
+    prepared_ = true;
+  }
+
+  void Commit() override {
+    if (committed_) {
+      throw std::logic_error(
+          "Composite cache step reservation can only be committed once.");
+    }
+    if (!prepared_) {
+      PrepareCommit();
+    }
+    // Publication crosses the transaction boundary and is never retried. Publish paged occupancy
+    // first: for this single validated reservation CommitValidated() performs no fallible allocation
+    // or device work, but it is not noexcept, so the Engine treats any throw as fatal. The fixed
+    // bank flip is noexcept and cannot leave the two states at different boundaries once reached.
+    paged_reservation_->CommitValidated();
+    if (fixed_reservation_) {
+      fixed_reservation_->PublishCommit();
+    }
+    allocated_requests_.insert(allocated_requests_.end(),
+                               newly_admitted_.begin(),
+                               newly_admitted_.end());
+    committed_ = true;
+  }
+
+  void Release() override {
+    if (committed_) {
+      throw std::logic_error("Cannot release a committed composite cache step reservation.");
+    }
+    // Discard the fixed provisional slots and release the paged blocks. Neither was published, so
+    // both are safe to reclaim. Aggregate errors so one failure does not skip the other cleanup.
+    std::exception_ptr release_error;
+    if (fixed_reservation_) {
+      try {
+        fixed_reservation_->Discard();
+      } catch (...) {
+        release_error = std::current_exception();
+      }
+    }
+    try {
+      paged_reservation_->Release();
+    } catch (...) {
+      if (!release_error) {
+        release_error = std::current_exception();
+      }
+    }
+    if (release_error) {
+      std::rethrow_exception(release_error);
+    }
+  }
+
+ private:
+  std::vector<std::shared_ptr<Request>>& allocated_requests_;
+  std::vector<std::shared_ptr<Request>> newly_admitted_;
+  // Destroyed in reverse declaration order: the fixed reservation unwinds before the paged one,
+  // matching the discard order in Release().
+  std::optional<PagedCacheReservation> paged_reservation_;
+  std::optional<FixedStateReservation> fixed_reservation_;
+  bool prepared_{};
+  bool committed_{};
+};
+
+}  // namespace
+
+std::unique_ptr<CacheManager> CacheManager::Create(std::shared_ptr<Model> model,
+                                                   size_t auxiliary_bytes_per_block,
+                                                   size_t auxiliary_reserved_memory_bytes) {
+  const ModelStateManifest manifest{model->config_->model.decoder};
+  if (model->config_->engine.dynamic_batching) {
+    ModelStateManifest::ValidateDynamicEngineCompatibility(model->config_->model.decoder);
+    return std::make_unique<PagedCacheManager>(
+        model, auxiliary_bytes_per_block, auxiliary_reserved_memory_bytes);
+  }
+  if (manifest.HasFixedStateGroups()) {
+    throw std::runtime_error(
+        "Fixed decoder state groups require engine.dynamic_batching");
+  }
+
+  return std::make_unique<StaticCacheManager>(model);
+}
+
+StaticCacheManager::StaticCacheManager(std::shared_ptr<Model> model)
+    : CacheManager(model) {}
+
+bool StaticCacheManager::CanAllocate(const std::vector<std::shared_ptr<Request>>& requests) const {
+  if (cache_allocated_requests_.empty()) {
+    return true;
+  }
+
+  if (std::all_of(cache_allocated_requests_.begin(), cache_allocated_requests_.end(),
+                  [](const std::shared_ptr<Request>& request) {
+                    return IsTurnComplete(request->status_) ||
+                           IsClosed(request->status_);
+                  })) {
+    return true;
+  }
+
+  return false;
+}
+
+void StaticCacheManager::Allocate(const std::vector<std::shared_ptr<Request>>& requests) {
+  assert(CanAllocate(requests));
+
+  if (!cache_allocated_requests_.empty() &&
+      std::all_of(cache_allocated_requests_.begin(), cache_allocated_requests_.end(),
+                  [](const std::shared_ptr<Request>& request) {
+                    return IsTurnComplete(request->status_) ||
+                           IsClosed(request->status_);
+                  })) {
+    // If every request is TurnComplete or Closed, recycle the static batch before allocating new requests.
+    Deallocate(cache_allocated_requests_);
+  }
+
+  for (const auto& request : requests) {
+    cache_allocated_requests_.push_back(request);
+  }
+
+  if (!key_value_cache_) {
+    auto request_with_max_max_sequence_length =
+        std::max_element(
+            requests.begin(), requests.end(),
+            [](const std::shared_ptr<Request>& a, const std::shared_ptr<Request>& b) {
+              return a->MaxSessionTokens() < b->MaxSessionTokens();
+            });
+
+    params_ = std::make_shared<GeneratorParams>(*model_);
+    params_->search.max_length = static_cast<int>(
+        (*request_with_max_max_sequence_length)->MaxSessionTokens());
+    params_->search.batch_size = static_cast<int>(cache_allocated_requests_.size());
+
+    key_value_cache_state_ = std::make_unique<KeyValueCacheState>(*params_, *model_);
+    key_value_cache_ = model_->p_device_kvcache_->CreateKeyValueCache(*key_value_cache_state_);
+    if (!key_value_cache_)
+      throw std::runtime_error("The selected execution provider did not create a KV cache for the static Engine.");
+    if (key_value_cache_->IsModelManaged()) {
+      throw std::runtime_error(
+          "Static Engine does not support model-managed KV caches. Use the Generator API for stateful "
+          "execution-provider models, or use a model with exposed past/present KV cache tensors.");
+    }
+
+    key_value_cache_->Add();
+  }
+}
+
+bool StaticCacheManager::SupportsDynamicBatching() const { return false; }
+
+void StaticCacheManager::Step() {
+  auto request_with_max_sequence_length =
+      std::max_element(
+          cache_allocated_requests_.begin(), cache_allocated_requests_.end(),
+          [](const std::shared_ptr<Request>& a, const std::shared_ptr<Request>& b) {
+            return a->CurrentSequenceLength() < b->CurrentSequenceLength();
+          });
+
+  const int64_t max_sequence_length = (*request_with_max_sequence_length)->CurrentSequenceLength();
+
+  key_value_cache_->Update({}, static_cast<int>(max_sequence_length));
+}
+
+void StaticCacheManager::Deallocate(std::vector<std::shared_ptr<Request>>& requests) {
+  if (std::set<std::shared_ptr<Request>>{requests.begin(), requests.end()} !=
+      std::set<std::shared_ptr<Request>>{cache_allocated_requests_.begin(), cache_allocated_requests_.end()}) {
+    throw std::runtime_error("Cannot dynamically deallocate statically batched requests.");
+  }
+
+  key_value_cache_.reset();
+  key_value_cache_state_.reset();
+  params_.reset();
+  cache_allocated_requests_.clear();
+}
+
+void StaticCacheManager::DetachRequestForTeardown(
+    const std::shared_ptr<Request>& request) noexcept {
+  if (!IsResident(request)) {
+    return;
+  }
+
+  // Static cache storage belongs to the whole batch. Engine teardown may therefore release the
+  // complete batch when detaching any resident Request.
+  key_value_cache_.reset();
+  key_value_cache_state_.reset();
+  params_.reset();
+  cache_allocated_requests_.clear();
+}
+
+std::vector<std::shared_ptr<Request>> StaticCacheManager::AllocatedRequests() const {
+  return cache_allocated_requests_;
+}
+
+bool StaticCacheManager::IsResident(const std::shared_ptr<Request>& request) const {
+  return std::find(cache_allocated_requests_.begin(), cache_allocated_requests_.end(), request) !=
+         cache_allocated_requests_.end();
+}
+
+PagedCacheManager::PagedCacheManager(std::shared_ptr<Model> model,
+                                     size_t auxiliary_bytes_per_block,
+                                     size_t auxiliary_reserved_memory_bytes)
+    : CacheManager(model),
+      params_(std::make_shared<GeneratorParams>(*model_)) {
+  // The paged cache resolves its own paged_kv group. The fixed pool is created only when the
+  // decoder manifest declares fixed state groups, so a dense paged model owns no pool and
+  // the composite path degrades to paged-only. Its capacity matches the paged batch limit so paged
+  // admission (bounded by max_batch_size) can never outrun fixed slots.
+  ModelStateManifest manifest{model->config_->model.decoder};
+  if (manifest.HasFixedStateGroups()) {
+    auto fixed_state_pool = std::make_unique<FixedStatePool>(
+        model, model_->config_->engine.dynamic_batching->max_batch_size);
+    fixed_state_pool_ = std::move(fixed_state_pool);
+  }
+  // Size the primary and auxiliary paged caches from one memory budget. The fixed pool above is
+  // already reflected in the free-memory query used by the paged cache.
+  key_value_cache_ = std::make_unique<PagedKeyValueCache>(
+      model, auxiliary_bytes_per_block, auxiliary_reserved_memory_bytes);
+  key_value_cache_state_ = std::make_unique<KeyValueCacheState>(*params_, *model_);
+}
+
+bool PagedCacheManager::CanAllocate(const std::vector<std::shared_ptr<Request>>& requests) const {
+  if (cache_allocated_requests_.size() + requests.size() > model_->config_->engine.dynamic_batching->max_batch_size) {
+    return false;
+  }
+
+  for (auto& request : requests) {
+    if (!key_value_cache_->CanAdd(request)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+void PagedCacheManager::Allocate(const std::vector<std::shared_ptr<Request>>& requests) {
+  if (fixed_state_pool_) {
+    throw std::logic_error(
+        "Composite models require transactional cache allocation.");
+  }
+  for (auto& request : requests) {
+    cache_allocated_requests_.push_back(request);
+    key_value_cache_->Add(request);
+  }
+}
+
+void PagedCacheManager::Step() {
+  if (fixed_state_pool_) {
+    throw std::logic_error(
+        "Composite models require transactional cache steps.");
+  }
+  for (auto& request : cache_allocated_requests_) {
+    if (IsTurnComplete(request->status_)) {
+      continue;
+    }
+
+    if (!key_value_cache_->CanAppendTokens(request)) {
+      throw std::runtime_error("Cannot append tokens to request that is not ready.");
+    }
+
+    key_value_cache_->AppendTokens(request);
+  }
+
+  key_value_cache_->UpdateState(*key_value_cache_state_, cache_allocated_requests_);
+}
+
+void PagedCacheManager::PrepareStep(
+    const std::vector<std::shared_ptr<Request>>& requests,
+    ExecutionContext& context) {
+  if (!context.cache_reservation) {
+    Step();
+    return;
+  }
+  if (!context.plan) {
+    throw std::logic_error("Transactional cache preparation requires a step plan.");
+  }
+
+  key_value_cache_->UpdateState(*key_value_cache_state_,
+                                requests,
+                                *context.cache_reservation,
+                                context.plan->proposed_block_table_columns);
+}
+
+void PagedCacheManager::Deallocate(std::vector<std::shared_ptr<Request>>& requests) {
+  // Removal and reaping release paged and fixed ownership together, mirroring how the transaction
+  // committed them together. Only requests that actually own committed state are touched; a request
+  // that was queued but never committed owns neither and is skipped so HandleFor cannot throw.
+  std::vector<std::shared_ptr<Request>> allocated_to_remove;
+  allocated_to_remove.reserve(requests.size());
+  std::vector<FixedStateSlotHandle> fixed_handles;
+  if (fixed_state_pool_) {
+    fixed_handles.reserve(requests.size());
+  }
+  for (const auto& request : requests) {
+    if (std::find(cache_allocated_requests_.begin(),
+                  cache_allocated_requests_.end(),
+                  request) == cache_allocated_requests_.end()) {
+      continue;
+    }
+    if (std::find(allocated_to_remove.begin(),
+                  allocated_to_remove.end(),
+                  request) != allocated_to_remove.end()) {
+      continue;
+    }
+    allocated_to_remove.push_back(request);
+    if (fixed_state_pool_) {
+      // A committed allocation always owns a committed fixed slot (they are published together), so
+      // this handle resolves; collect them all before releasing so a stale handle cannot leave the
+      // two states partially released.
+      fixed_handles.push_back(fixed_state_pool_->HandleFor(request.get()));
+    }
+  }
+
+  // Validate every ownership system before releasing the first resource. Publication below is
+  // allocation-free and noexcept. Any disagreement during publication is an impossible invariant
+  // violation and terminates rather than silently orphaning one ownership system.
+  for (const auto& handle : fixed_handles) {
+    fixed_state_pool_->ValidateRelease(handle);
+  }
+  for (const auto& request : allocated_to_remove) {
+    key_value_cache_->ValidateRemove(request.get());
+  }
+
+  for (const auto& handle : fixed_handles) {
+    fixed_state_pool_->ReleaseValidated(handle);
+  }
+  for (const auto& request : allocated_to_remove) {
+    key_value_cache_->RemoveValidated(request.get());
+  }
+
+  cache_allocated_requests_.erase(
+      std::remove_if(cache_allocated_requests_.begin(), cache_allocated_requests_.end(),
+                     [&allocated_to_remove](const std::shared_ptr<Request>& request) {
+                       return std::find(allocated_to_remove.begin(),
+                                        allocated_to_remove.end(),
+                                        request) != allocated_to_remove.end();
+                     }),
+      cache_allocated_requests_.end());
+}
+
+void PagedCacheManager::DetachRequestForTeardown(
+    const std::shared_ptr<Request>& request) noexcept {
+  if (std::find(cache_allocated_requests_.begin(),
+                cache_allocated_requests_.end(),
+                request) == cache_allocated_requests_.end()) {
+    return;
+  }
+
+  // Engine teardown invalidates every resident Request, so release the complete paged and fixed
+  // cache state at once rather than walking ownership systems that cannot be used again.
+  fixed_state_pool_.reset();
+  key_value_cache_.reset();
+  key_value_cache_state_.reset();
+  params_.reset();
+  cache_allocated_requests_.clear();
+}
+
+bool PagedCacheManager::SupportsDynamicBatching() const { return true; }
+
+size_t PagedCacheManager::MaxDraftTokensPerStep() const {
+  // Recurrent state can only be replayed through the compact transitions the operators captured.
+  // Without fixed state the paged KV boundary alone decides, and any tail slot can be left
+  // uncommitted.
+  size_t limit = kMaxDraftTokensPerStep;
+  if (fixed_state_pool_) {
+    limit = std::min(limit, fixed_state_pool_->StateUpdateCapacity());
+  }
+  if (const size_t query_cap = MaxQueryTokensPerRequest(); query_cap != 0) {
+    limit = std::min(limit, query_cap - 1);
+  }
+  return limit;
+}
+
+std::vector<std::shared_ptr<Request>> PagedCacheManager::AllocatedRequests() const {
+  return cache_allocated_requests_;
+}
+
+bool PagedCacheManager::IsResident(const std::shared_ptr<Request>& request) const {
+  return key_value_cache_->OwnsRequest(request.get());
+}
+
+StepPlanningResult PagedCacheManager::PlanStepResources(StepPlan& plan) const {
+  plan.fixed_state = {};
+  if (fixed_state_pool_) {
+    const bool has_prefill = std::any_of(
+        plan.requests.begin(), plan.requests.end(),
+        [](const RequestStepPlan& entry) { return entry.is_prefill; });
+    const bool has_drafts = std::any_of(
+        plan.requests.begin(), plan.requests.end(),
+        [](const RequestStepPlan& entry) { return entry.draft_token_count != 0; });
+    if (has_prefill && has_drafts) {
+      // Packed recurrent operators cannot capture intermediate draft checkpoints while a prefill
+      // shares the step. Remove those optional rows before paged capacity planning so they cannot
+      // displace a request that the actual mixed step has room to execute.
+      for (auto& entry : plan.requests) {
+        entry.unprocessed_token_count -= entry.draft_token_count;
+        entry.target_cache_slots -= entry.draft_token_count;
+        entry.draft_token_count = 0;
+      }
+    }
+  }
+  auto result = key_value_cache_->PlanStepResources(plan);
+  if (!fixed_state_pool_) {
+    return result;
+  }
+
+  // Paged and fixed ownership advance together at commit, so their committed counts must agree
+  // between steps. A divergence means a prior commit or removal left them out of step.
+  // Uses cheap pool accessors (no per-step snapshot allocation) since planning runs every step.
+  if (fixed_state_pool_->CommittedSlotCount() != cache_allocated_requests_.size()) {
+    throw StepPlanningConsistencyError(
+        "Paged and fixed state committed ownership counts differ.");
+  }
+  for (const auto& request : cache_allocated_requests_) {
+    const auto fixed_state =
+        fixed_state_pool_->CommittedState(request.get());
+    if (!fixed_state) {
+      throw StepPlanningConsistencyError(
+          "A paged cache resident has no committed fixed state slot.");
+    }
+    const auto processed_tokens = request->ProcessedSequenceLength();
+    if (processed_tokens < 0 ||
+        key_value_cache_->CommittedSlots(request.get()) !=
+            static_cast<size_t>(processed_tokens) ||
+        fixed_state->committed_tokens !=
+            static_cast<uint64_t>(processed_tokens)) {
+      throw StepPlanningConsistencyError(
+          "A resident request and its decoder state have different committed token boundaries.");
+    }
+  }
+  if (!result.executable) {
+    return result;
+  }
+
+  size_t new_slot_count = 0;
+  for (const auto& entry : plan.requests) {
+    // Cross-check per-request ownership against the fixed pool: a resident must own a committed
+    // fixed slot and a new admission must not. This catches drift between the paged planner's
+    // membership decision and fixed ownership before the reservation is built.
+    const bool owns_fixed_slot =
+        fixed_state_pool_->OwnsCommittedSlot(entry.request_id);
+    if (entry.newly_admitted == owns_fixed_slot) {
+      throw StepPlanningConsistencyError(
+          "Fixed state ownership does not match the paged step plan membership.");
+    }
+    if (entry.newly_admitted) {
+      ++new_slot_count;
+    }
+  }
+  // Paged admission is bounded by max_batch_size, which equals fixed capacity, so this always holds;
+  // a violation would mean paged and fixed capacity accounting diverged and is a logic error.
+  if (new_slot_count > fixed_state_pool_->AvailableSlots()) {
+    throw StepPlanningConsistencyError(
+        "Paged planning selected more admissions than fixed state can reserve.");
+  }
+  const bool capture_state_updates = std::any_of(
+      plan.requests.begin(), plan.requests.end(),
+      [](const RequestStepPlan& entry) { return entry.draft_token_count != 0; });
+  if (capture_state_updates && !fixed_state_pool_->SupportsStateUpdates()) {
+    throw std::logic_error(
+        "Planned draft verification on a model whose fixed state declares no compact updates.");
+  }
+  plan.fixed_state = FixedStateResourcePlan{
+      true,
+      plan.requests.size(),
+      new_slot_count,
+      fixed_state_pool_->PlannedStagingBytes(
+          plan.requests.size(), capture_state_updates),
+  };
+  return result;
+}
+
+void PagedCacheManager::OrderStepForExecution(StepPlan& plan) const {
+  if (!fixed_state_pool_ ||
+      std::any_of(plan.requests.begin(), plan.requests.end(),
+                  [](const RequestStepPlan& entry) { return entry.newly_admitted; })) {
+    return;
+  }
+
+  std::sort(plan.requests.begin(), plan.requests.end(),
+            [this](const RequestStepPlan& left, const RequestStepPlan& right) {
+              const auto left_state = fixed_state_pool_->CommittedState(left.request_id);
+              const auto right_state = fixed_state_pool_->CommittedState(right.request_id);
+              if (!left_state || !right_state) {
+                throw StepPlanningConsistencyError(
+                    "Cannot order a resident batch with missing fixed state.");
+              }
+              return left_state->handle.slot < right_state->handle.slot;
+            });
+}
+
+std::unique_ptr<CacheStepReservation> PagedCacheManager::ReserveStep(const StepPlan& plan) {
+  return std::make_unique<CompositeCacheStepReservation>(
+      *key_value_cache_, fixed_state_pool_.get(), cache_allocated_requests_, plan);
+}
+
+}  // namespace Generators
+
+===== FILE: src\dflash2_drafter.cpp =====
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+#include "generator/generators.h"
+#include "dflash2_drafter.h"
+#include "engine/request.h"
+#include "models/io/kv_cache.h"
+
+#include <algorithm>
+#include <array>
+#include <limits>
+#include <numeric>
+#include <string>
+#include <string_view>
+#include <unordered_set>
+#include <utility>
+
+namespace Generators {
+
+namespace {
+
+// The drafter's packed stream is [context rows of request 0, its block rows, context rows of
+// request 1, ...]. PagedAttention derives each row's position from past_sequence_lengths plus its
+// offset within the request, so the block rows land at the anchor's position and the ones after it.
+struct PackedLayout {
+  std::vector<int32_t> q_row_map;
+  std::vector<int32_t> qkv_row_map;
+  std::vector<int32_t> block_row_index;
+  std::vector<int32_t> cumulative_sequence_lengths{0};
+  std::vector<int32_t> past_sequence_lengths;
+  int32_t max_query_len{};
+  int32_t max_kv_len{};
+  int32_t min_kv_len{std::numeric_limits<int32_t>::max()};
+};
+
+size_t CheckedAdd(size_t left, size_t right, std::string_view description) {
+  if (right > std::numeric_limits<size_t>::max() - left) {
+    throw std::runtime_error(std::string{description} + " exceeds the supported size range.");
+  }
+  return left + right;
+}
+
+size_t CheckedMultiply(size_t left, size_t right, std::string_view description) {
+  if (left != 0 && right > std::numeric_limits<size_t>::max() / left) {
+    throw std::runtime_error(std::string{description} + " exceeds the supported size range.");
+  }
+  return left * right;
+}
+
+int32_t CheckedMetadataValue(size_t value, std::string_view description) {
+  if (value > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+    throw std::runtime_error(
+        std::string{description} + " exceeds the int32 attention metadata range.");
+  }
+  return static_cast<int32_t>(value);
+}
+
+void InheritProviderOptions(const Config::SessionOptions& parent,
+                            Config::SessionOptions& child) {
+  if (child.providers.empty()) {
+    child.providers = parent.providers;
+  }
+  for (const auto& parent_provider : parent.provider_options) {
+    auto child_provider = std::find_if(
+        child.provider_options.begin(), child.provider_options.end(),
+        [&parent_provider](const Config::ProviderOptions& provider) {
+          return provider.name == parent_provider.name;
+        });
+    if (child_provider == child.provider_options.end()) {
+      child.provider_options.push_back(parent_provider);
+      continue;
+    }
+    if (!child_provider->device_filtering_options) {
+      child_provider->device_filtering_options = parent_provider.device_filtering_options;
+    }
+    for (const auto& parent_option : parent_provider.options) {
+      const bool overridden = std::any_of(
+          child_provider->options.begin(), child_provider->options.end(),
+          [&parent_option](const Config::NamedString& option) {
+            return option.first == parent_option.first;
+          });
+      if (!overridden) {
+        child_provider->options.push_back(parent_option);
+      }
+    }
+  }
+}
+
+void RequireTensor(const ModelStateMetadata& metadata, const std::string& name,
+                   bool input, ONNXTensorElementDataType type, size_t rank) {
+  const bool present = input ? metadata.HasInput(name) : metadata.HasOutput(name);
+  if (name.empty() || !present) {
+    throw std::runtime_error(
+        "model.dflash2 " + std::string{input ? "input '" : "output '"} + name + "' is missing.");
+  }
+  const auto actual_type = input ? metadata.GetInputDataType(name) : metadata.GetOutputDataType(name);
+  const auto shape = input ? metadata.GetInputShape(name) : metadata.GetOutputShape(name);
+  if (actual_type != type || shape.size() != rank) {
+    throw std::runtime_error(
+        "model.dflash2 " + std::string{input ? "input '" : "output '"} + name +
+        "' has an incompatible type or rank.");
+  }
+}
+
+}  // namespace
+
+size_t Dflash2DraftWidth(size_t capability_limit, size_t configured_limit,
+                         size_t sequence_length_after_step, size_t sequence_limit,
+                         size_t remaining_turn_tokens_after_step) {
+  const size_t sequence_capacity =
+      sequence_length_after_step < sequence_limit &&
+              sequence_limit - sequence_length_after_step > 1
+          ? sequence_limit - sequence_length_after_step - 1
+          : 0;
+  const size_t turn_capacity =
+      remaining_turn_tokens_after_step > 1 ? remaining_turn_tokens_after_step - 1 : 0;
+  return std::min({capability_limit, configured_limit, sequence_capacity, turn_capacity});
+}
+
+std::unique_ptr<Config> CreateDflash2Config(const Config& config) {
+  const auto& dflash2 = config.model.dflash2;
+  if (!config.model.mtp.filename.empty()) {
+    throw std::runtime_error(
+        "An Engine model cannot configure both model.mtp and model.dflash2.");
+  }
+  if (dflash2.filename.empty()) {
+    throw std::runtime_error("model.dflash2.filename is required to create a DFlash 2 drafter.");
+  }
+  if (dflash2.num_hidden_layers <= 0 || dflash2.num_key_value_heads <= 0 || dflash2.head_size <= 0 ||
+      dflash2.block_size <= 1 || dflash2.num_draft_tokens <= 0 || dflash2.selector_top_k <= 0) {
+    throw std::runtime_error("model.dflash2 geometry must be positive and describe a block of >1 token.");
+  }
+  const int expected_draft_tokens = dflash2.block_size - (dflash2.is_dspark ? 0 : 1);
+  if (dflash2.num_draft_tokens != expected_draft_tokens) {
+    throw std::runtime_error(dflash2.is_dspark
+                                 ? "model.dspark.num_draft_tokens must be block_size."
+                                 : "model.dflash2.num_draft_tokens must be block_size - 1.");
+  }
+  if (!dflash2.is_dspark && dflash2.sliding_window <= 0) {
+    throw std::runtime_error("model.dflash2.sliding_window must be greater than zero.");
+  }
+  // Every non-anchor query row feeds this id straight into the drafter's embedding lookup, so an
+  // out-of-range value is either a crash or silently meaningless drafts.
+  if (config.model.vocab_size <= 0) {
+    throw std::runtime_error(
+        "model.vocab_size must be positive to validate model.dflash2.mask_token_id.");
+  }
+  if (dflash2.mask_token_id < 0 || dflash2.mask_token_id >= config.model.vocab_size) {
+    throw std::runtime_error(
+        "model.dflash2.mask_token_id must be a valid token id in [0, model.vocab_size).");
+  }
+  if (dflash2.run_options) {
+    for (const auto& [name, value] : *dflash2.run_options) {
+      if (name == "disable_synchronize_execution_providers" && value == "1") {
+        throw std::runtime_error(
+            "model.dflash2.run_options cannot disable execution-provider synchronization.");
+      }
+    }
+  }
+
+  auto projected = std::make_unique<Config>(config);
+  auto& decoder = projected->model.decoder;
+  decoder.filename = dflash2.filename;
+  if (dflash2.session_options) {
+    decoder.session_options = *dflash2.session_options;
+    InheritProviderOptions(config.model.decoder.session_options,
+                           decoder.session_options);
+  }
+  decoder.run_options = dflash2.run_options;
+  decoder.shared_initializers = dflash2.shared_initializers;
+  decoder.num_hidden_layers = dflash2.num_hidden_layers;
+  decoder.num_key_value_heads = dflash2.num_key_value_heads;
+  decoder.head_size = dflash2.head_size;
+  decoder.state_groups.reset();
+  decoder.sliding_window.reset();
+  return projected;
+}
+
+ONNXTensorElementDataType ValidateDflash2ModelCompatibility(
+    const Config& config,
+    const ModelStateMetadata& target_metadata,
+    const ModelStateMetadata& drafter_metadata,
+    size_t paged_block_size) {
+  const auto& dflash2 = config.model.dflash2;
+  const auto& target_aux_output = dflash2.main_aux_hidden_states;
+  if (target_aux_output.empty() || !target_metadata.HasOutput(target_aux_output)) {
+    throw std::runtime_error(
+        "model.dflash2.main_aux_hidden_states must name a main-model output.");
+  }
+
+  const auto& drafter_aux_input = dflash2.inputs.aux_hidden_states;
+  if (drafter_aux_input.empty() || !drafter_metadata.HasInput(drafter_aux_input)) {
+    throw std::runtime_error(
+        "model.dflash2.inputs.aux_hidden_states must name a drafter-model input.");
+  }
+
+  const auto target_aux_shape = target_metadata.GetOutputShape(target_aux_output);
+  const auto drafter_aux_shape = drafter_metadata.GetInputShape(drafter_aux_input);
+  if (target_aux_shape.size() != 2 || target_aux_shape[0] >= 0 || target_aux_shape[1] <= 0 ||
+      drafter_aux_shape.size() != 2 || drafter_aux_shape[0] >= 0 || drafter_aux_shape[1] <= 0 ||
+      target_aux_shape[1] != drafter_aux_shape[1]) {
+    throw std::runtime_error(
+        "DFlash 2 requires matching 2-D auxiliary hidden-state tensors with dynamic rows and a "
+        "static width.");
+  }
+  if (target_metadata.GetOutputDataType(target_aux_output) !=
+      drafter_metadata.GetInputDataType(drafter_aux_input)) {
+    throw std::runtime_error(
+        "DFlash 2 requires matching auxiliary hidden-state tensor types.");
+  }
+
+  const auto& inputs = dflash2.inputs;
+  std::unordered_set<std::string> input_names;
+  for (const auto* name : {&inputs.q_row_map, &inputs.qkv_row_map,
+                           &inputs.block_row_index, &inputs.cumulative_sequence_lengths,
+                           &inputs.past_sequence_lengths}) {
+    RequireTensor(drafter_metadata, *name, true, Ort::TypeToTensorType<int32_t>, 1);
+    if (drafter_metadata.GetInputShape(*name)[0] >= 0 || !input_names.insert(*name).second) {
+      throw std::runtime_error(
+          "model.dflash2 packed vector inputs must have dynamic lengths and unique names.");
+    }
+  }
+  RequireTensor(drafter_metadata, inputs.input_ids, true,
+                Ort::TypeToTensorType<int64_t>, 1);
+  if (drafter_metadata.GetInputShape(inputs.input_ids)[0] >= 0 ||
+      !input_names.insert(inputs.input_ids).second) {
+    throw std::runtime_error(
+        "model.dflash2 input_ids must have a dynamic length and a unique name.");
+  }
+  RequireTensor(drafter_metadata, inputs.block_table, true,
+                Ort::TypeToTensorType<int32_t>, 2);
+  const auto block_table_shape = drafter_metadata.GetInputShape(inputs.block_table);
+  if (block_table_shape[0] >= 0 || block_table_shape[1] >= 0 ||
+      !input_names.insert(inputs.block_table).second) {
+    throw std::runtime_error(
+        "model.dflash2 block_table must have two dynamic dimensions and a unique name.");
+  }
+  RequireTensor(drafter_metadata, inputs.attention_metadata, true,
+                Ort::TypeToTensorType<int32_t>, 1);
+  const auto metadata_shape = drafter_metadata.GetInputShape(inputs.attention_metadata);
+  if (metadata_shape[0] != 3 || !input_names.insert(inputs.attention_metadata).second) {
+    throw std::runtime_error(
+        "model.dflash2 attention_metadata must contain three values and have a unique name.");
+  }
+  if (!input_names.insert(inputs.aux_hidden_states).second) {
+    throw std::runtime_error("model.dflash2 input names must be unique.");
+  }
+
+  ONNXTensorElementDataType cache_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+  std::unordered_set<std::string> cache_output_names;
+  for (int layer = 0; layer < dflash2.num_hidden_layers; ++layer) {
+    const std::array<std::pair<std::string, std::string>, 2> cache_names{
+        std::pair{ComposeKeyValueName(dflash2.inputs.past_key_names, layer),
+                  ComposeKeyValueName(dflash2.outputs.present_key_names, layer)},
+        std::pair{ComposeKeyValueName(dflash2.inputs.past_value_names, layer),
+                  ComposeKeyValueName(dflash2.outputs.present_value_names, layer)}};
+    for (const auto& [input_name, output_name] : cache_names) {
+      if (!input_names.insert(input_name).second ||
+          !cache_output_names.insert(output_name).second) {
+        throw std::runtime_error("DFlash 2 cache input and output names must be unique.");
+      }
+      if (!drafter_metadata.HasInput(input_name) || !drafter_metadata.HasOutput(output_name)) {
+        throw std::runtime_error("DFlash 2 requires every configured cache input and output.");
+      }
+      const auto input_shape = drafter_metadata.GetInputShape(input_name);
+      const auto output_shape = drafter_metadata.GetOutputShape(output_name);
+      const auto valid_shape = [&](const std::vector<int64_t>& shape) {
+        return shape.size() == 4 && shape[0] < 0 &&
+               shape[1] == static_cast<int64_t>(paged_block_size) &&
+               shape[2] == dflash2.num_key_value_heads && shape[3] == dflash2.head_size;
+      };
+      if (!valid_shape(input_shape) || !valid_shape(output_shape) || input_shape != output_shape) {
+        throw std::runtime_error(
+            "DFlash 2 cache tensors must have matching 4-D paged-cache geometry.");
+      }
+      const auto input_type = drafter_metadata.GetInputDataType(input_name);
+      const auto output_type = drafter_metadata.GetOutputDataType(output_name);
+      const bool supported_type = input_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+                                  input_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 ||
+                                  input_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16;
+      if (input_type != output_type ||
+          (cache_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED && input_type != cache_type) ||
+          !supported_type) {
+        throw std::runtime_error(
+            "DFlash 2 cache tensors must have one supported floating-point element type.");
+      }
+      cache_type = input_type;
+    }
+  }
+
+  const auto& candidate_ids = dflash2.outputs.candidate_ids;
+  const auto& scores = dflash2.outputs.scores;
+  if (!cache_output_names.insert(candidate_ids).second ||
+      !cache_output_names.insert(scores).second ||
+      !drafter_metadata.HasOutput(candidate_ids) || !drafter_metadata.HasOutput(scores)) {
+    throw std::runtime_error(
+        "DFlash 2 requires unique configured candidate, score, and cache outputs.");
+  }
+  const auto candidate_shape = drafter_metadata.GetOutputShape(candidate_ids);
+  const auto score_shape = drafter_metadata.GetOutputShape(scores);
+  if (drafter_metadata.GetOutputDataType(candidate_ids) != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 ||
+      candidate_shape.size() != 3 || candidate_shape[0] >= 0 ||
+      candidate_shape[1] != dflash2.num_draft_tokens ||
+      candidate_shape[2] != dflash2.selector_top_k ||
+      drafter_metadata.GetOutputDataType(scores) != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      score_shape.size() != 4 || score_shape[0] >= 0 ||
+      candidate_shape[0] != score_shape[0] ||
+      score_shape[1] != dflash2.num_draft_tokens ||
+      score_shape[2] != dflash2.selector_top_k || score_shape[3] != dflash2.selector_top_k) {
+    throw std::runtime_error(
+        "DFlash 2 candidate and score outputs do not match the configured lattice geometry.");
+  }
+  return cache_type;
+}
+
+Dflash2Model::Dflash2Model(std::unique_ptr<Config> config, OrtEnv& ort_env)
+    : Model{std::move(config)} {
+  session_ = CreateSession(ort_env, config_->model.decoder.filename, session_options_.get());
+  session_info_.Add(*session_);
+}
+
+std::unique_ptr<State> Dflash2Model::CreateState(DeviceSpan<int32_t>, const GeneratorParams&) const {
+  throw std::logic_error("The DFlash 2 drafter is driven by the Engine and has no State.");
+}
+
+size_t Dflash2Drafter::BytesPerBlock(const Config& config, size_t paged_block_size,
+                                     ONNXTensorElementDataType cache_type) {
+  const auto& dflash2 = config.model.dflash2;
+  if (dflash2.filename.empty()) {
+    return 0;
+  }
+  size_t elements = CheckedMultiply(size_t{2}, static_cast<size_t>(dflash2.num_hidden_layers),
+                                    "DFlash 2 cache elements");
+  elements = CheckedMultiply(elements, paged_block_size, "DFlash 2 cache elements");
+  elements = CheckedMultiply(elements, static_cast<size_t>(dflash2.num_key_value_heads),
+                             "DFlash 2 cache elements");
+  elements = CheckedMultiply(elements, static_cast<size_t>(dflash2.head_size),
+                             "DFlash 2 cache elements");
+  return CheckedMultiply(elements, Ort::SizeOf(cache_type), "DFlash 2 cache bytes");
+}
+
+size_t Dflash2Drafter::PoolBlocks(const Config& config, size_t paged_block_size,
+                                  size_t max_batch_size) {
+  const auto& dflash2 = config.model.dflash2;
+  if (dflash2.filename.empty() || dflash2.sliding_window <= 0) {
+    // Full attention is sized against the target's block count through BytesPerBlock().
+    return 0;
+  }
+  if (paged_block_size == 0) {
+    throw std::runtime_error("The DFlash 2 paged cache block size must be positive.");
+  }
+  // The window bounds what a query block can ever read, so a request only needs a ring long enough
+  // to hold that window plus the block itself, whatever its context length.
+  const size_t positions = CheckedAdd(
+      static_cast<size_t>(dflash2.sliding_window),
+      CheckedMultiply(size_t{2}, static_cast<size_t>(dflash2.block_size),
+                      "DFlash 2 cache ring positions"),
+      "DFlash 2 cache ring positions");
+  const size_t rounded_blocks = positions / paged_block_size +
+                                static_cast<size_t>(positions % paged_block_size != 0);
+  const size_t ring = CheckedAdd(rounded_blocks, size_t{1}, "DFlash 2 cache ring blocks");
+  return CheckedMultiply(std::max(max_batch_size, size_t{1}), ring,
+                         "DFlash 2 cache block count");
+}
+
+size_t Dflash2Drafter::FullAttentionPoolBlocks(size_t target_blocks, size_t paged_block_size,
+                                               size_t query_block_size,
+                                               size_t max_batch_size) {
+  if (paged_block_size == 0 || query_block_size == 0) {
+    throw std::runtime_error("DFlash 2 block sizes must be positive.");
+  }
+  const size_t spill_blocks = (query_block_size - 1) / paged_block_size + 1;
+  return CheckedAdd(
+      target_blocks,
+      CheckedMultiply(max_batch_size, spill_blocks, "DFlash 2 query spill blocks"),
+      "DFlash 2 full-attention cache pool blocks");
+}
+
+size_t Dflash2Drafter::FullAttentionReservedBytes(size_t paged_block_size,
+                                                  size_t query_block_size,
+                                                  size_t max_batch_size,
+                                                  size_t bytes_per_block) {
+  const size_t spill_blocks = FullAttentionPoolBlocks(
+      0, paged_block_size, query_block_size, max_batch_size);
+  return CheckedMultiply(spill_blocks, bytes_per_block,
+                         "DFlash 2 query spill bytes");
+}
+
+Dflash2Drafter::Dflash2Drafter(std::shared_ptr<Dflash2Model> model, size_t paged_block_size,
+                               size_t num_blocks, size_t max_requests)
+    : model_{std::move(model)},
+      config_{model_->config_->model.dflash2},
+      paged_block_size_{paged_block_size},
+      num_blocks_{num_blocks},
+      max_requests_{max_requests} {
+  if (paged_block_size_ == 0 || num_blocks_ == 0 || max_requests_ == 0) {
+    throw std::runtime_error("The DFlash 2 drafter needs a non-empty paged cache pool.");
+  }
+  if (num_blocks_ > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+    throw std::runtime_error("The DFlash 2 drafter cache exceeds the int32 block-id range.");
+  }
+  query_spill_blocks_ = (static_cast<size_t>(config_.block_size) - 1) / paged_block_size_ + 1;
+  if (config_.sliding_window > 0) {
+    // Positions older than this are masked out of every query row, so they are never ingested and
+    // the ring may alias them.
+    context_window_ = static_cast<size_t>(config_.sliding_window) +
+                      static_cast<size_t>(config_.block_size);
+    ring_blocks_ =
+        (context_window_ + static_cast<size_t>(config_.block_size) + paged_block_size_ - 1) /
+            paged_block_size_ +
+        1;
+  }
+
+  const auto& inputs = config_.inputs;
+  aux_type_ = model_->session_info_.GetInputDataType(inputs.aux_hidden_states);
+  const auto aux_shape = model_->session_info_.GetInputShape(inputs.aux_hidden_states);
+  if (aux_shape.size() != 2 || aux_shape[1] <= 0) {
+    throw std::runtime_error("model.dflash2 expects a 2-D aux_hidden_states input with a static width.");
+  }
+  aux_hidden_size_ = static_cast<size_t>(aux_shape[1]);
+
+  AllocateCache();
+
+  free_blocks_.resize(num_blocks_);
+  std::iota(free_blocks_.rbegin(), free_blocks_.rend(), int32_t{0});
+
+  run_options_ = OrtRunOptions::Create();
+  if (model_->config_->model.decoder.run_options) {
+    for (const auto& entry : *model_->config_->model.decoder.run_options) {
+      if (entry.first != "gpu_graph_id") {
+        run_options_->AddConfigEntry(entry.first.c_str(), entry.second.c_str());
+      }
+    }
+  }
+  // Proposal tensors keep a stable address but not a stable shape, so they are not capturable.
+  run_options_->AddConfigEntry("gpu_graph_id", "-1");
+}
+
+Tensor& Dflash2StepTensor(std::unique_ptr<Tensor>& slot, DeviceInterface* device,
+                          ONNXTensorElementDataType type, const std::vector<int64_t>& shape) {
+  size_t elements = 1;
+  for (const int64_t dimension : shape) {
+    elements = CheckedMultiply(elements, static_cast<size_t>(dimension), "DFlash 2 proposal tensor");
+  }
+  const size_t bytes = CheckedMultiply(elements, Ort::SizeOf(type), "DFlash 2 proposal tensor");
+  // A static Tensor rejects a shape larger than the buffer it already owns, and it keeps the element
+  // type it was constructed with, so either one changing has to start a new buffer. Every other step
+  // reshapes a view over the buffer it kept.
+  size_t capacity = bytes;
+  if (!slot || slot->type_ != type || slot->bytes_ < bytes) {
+    // A full-attention drafter's block table gains a column every `paged_block_size` committed
+    // tokens, so sizing a new buffer to exactly this step's shape would allocate again a few steps
+    // later, forever. Doubling amortizes that to O(log positions) allocations per request.
+    const size_t previous_bytes = slot ? slot->bytes_ : 0;
+    if (previous_bytes <= std::numeric_limits<size_t>::max() / 2) {
+      capacity = std::max(bytes, previous_bytes * 2);
+    }
+    slot = std::make_unique<Tensor>(device, type);
+  }
+  slot->CreateTensor(shape, /*make_static=*/true, std::max<size_t>(capacity, 1));
+  return *slot;
+}
+
+bool Dflash2CanJoin(bool draft_eligible, size_t first_position) noexcept {
+  return draft_eligible && first_position == 0;
+}
+
+void Dflash2Drafter::AllocateCache() {
+  const size_t layers = static_cast<size_t>(config_.num_hidden_layers);
+  const std::vector<int64_t> shape{static_cast<int64_t>(num_blocks_),
+                                   static_cast<int64_t>(paged_block_size_),
+                                   config_.num_key_value_heads,
+                                   config_.head_size};
+  cache_type_ = model_->session_info_.GetInputDataType(
+      ComposeKeyValueName(config_.inputs.past_key_names, 0));
+  for (size_t layer = 0; layer < layers; ++layer) {
+    for (const auto* pattern : {&config_.inputs.past_key_names, &config_.inputs.past_value_names}) {
+      cache_input_names_.push_back(ComposeKeyValueName(*pattern, static_cast<int>(layer)));
+      auto cache = std::make_unique<Tensor>(model_->p_device_kvcache_, cache_type_);
+      cache->CreateTensor(shape);
+      cache->GetByteSpan().Zero();
+      caches_.push_back(std::move(cache));
+    }
+    cache_output_names_.push_back(ComposeKeyValueName(config_.outputs.present_key_names, static_cast<int>(layer)));
+    cache_output_names_.push_back(ComposeKeyValueName(config_.outputs.present_value_names, static_cast<int>(layer)));
+  }
+}
+
+bool Dflash2Drafter::Admit(const Feed& feed) {
+  if (requests_.find(feed.request) != requests_.end()) {
+    return true;
+  }
+  if (!Dflash2CanJoin(feed.draft_eligible, feed.first_position)) {
+    return false;
+  }
+  // Requests that arrive when the ring pool is full decode without DFlash 2 drafts instead of
+  // taking the whole drafter down.
+  if (ring_blocks_ != 0) {
+    if (free_blocks_.size() < ring_blocks_) {
+      ++admission_misses_;
+      return false;
+    }
+    // Claim the whole ring now so a second new request in the same step sees the smaller pool.
+    EnsureBlocks(requests_[feed.request], 0);
+    return true;
+  }
+  // A full-attention pool only mirrors the target's blocks plus one query-block spill per sized
+  // request, and requests that are resident but idle keep both. Admitting past that bound would
+  // let a later step exhaust the pool mid-proposal, which fails the whole drafter rather than one
+  // request, so refuse here the way the windowed drafter refuses a ring.
+  if (requests_.size() >= max_requests_ || free_blocks_.size() < query_spill_blocks_) {
+    ++admission_misses_;
+    return false;
+  }
+  requests_.emplace(feed.request, RequestState{});
+  return true;
+}
+
+void Dflash2Drafter::EnsureBlocks(RequestState& state, size_t positions) {
+  const size_t needed =
+      ring_blocks_ != 0 ? ring_blocks_ : (positions + paged_block_size_ - 1) / paged_block_size_;
+  while (state.blocks.size() < needed) {
+    if (free_blocks_.empty()) {
+      throw std::runtime_error("The DFlash 2 drafter's paged cache pool is exhausted.");
+    }
+    state.blocks.push_back(free_blocks_.back());
+    free_blocks_.pop_back();
+  }
+}
+
+void Dflash2Drafter::Release(const Request* request) {
+  auto entry = requests_.find(request);
+  if (entry == requests_.end()) {
+    return;
+  }
+  free_blocks_.insert(free_blocks_.end(), entry->second.blocks.begin(), entry->second.blocks.end());
+  requests_.erase(entry);
+}
+
+void Dflash2Drafter::ReleaseAll() {
+  for (const auto& [request, state] : requests_) {
+    free_blocks_.insert(free_blocks_.end(), state.blocks.begin(), state.blocks.end());
+  }
+  requests_.clear();
+}
+
+bool Dflash2Drafter::Propose(Tensor& aux_hidden_states, std::span<const Feed> feeds,
+                             std::vector<std::vector<int32_t>>& drafts) {
+  drafts.assign(feeds.size(), {});
+  if (feeds.empty()) {
+    return false;
+  }
+
+  const size_t block_size = static_cast<size_t>(config_.block_size);
+  const size_t num_spec = static_cast<size_t>(config_.num_draft_tokens);
+  const size_t top_k = static_cast<size_t>(config_.selector_top_k);
+
+  // Only requests the ring pool can hold take part; the rest keep decoding without drafts.
+  std::vector<size_t> served;
+  served.reserve(feeds.size());
+  for (size_t i = 0; i < feeds.size(); ++i) {
+    if (Admit(feeds[i])) {
+      served.push_back(i);
+    }
+  }
+  if (served.empty()) {
+    return false;
+  }
+
+  // Batch layout. Every served feed contributes its context rows so the drafter cache never
+  // develops a hole; only the feeds that asked also contribute a query block.
+  std::vector<size_t> block_feed_indices;
+  for (const size_t i : served) {
+    if (feeds[i].wants_drafts) {
+      block_feed_indices.push_back(i);
+    }
+  }
+  // The graph reshapes the query rows to [batch, block_size, hidden], so it needs at least one
+  // block. When nothing is eligible, borrow the first served feed's slot and drop its lattice: the
+  // block rows only write scratch K/V at positions a later step overwrites.
+  const bool drafts_wanted = !block_feed_indices.empty();
+  if (!drafts_wanted) {
+    block_feed_indices.push_back(served.front());
+  }
+  std::vector<size_t> block_slot_of_feed(feeds.size(), block_feed_indices.size());
+  for (size_t slot = 0; slot < block_feed_indices.size(); ++slot) {
+    block_slot_of_feed[block_feed_indices[slot]] = slot;
+  }
+
+  const size_t num_block_rows =
+      CheckedMultiply(block_feed_indices.size(), block_size, "DFlash 2 block rows");
+  CheckedMetadataValue(num_block_rows, "DFlash 2 block rows");
+  size_t num_ctx_rows = 0;
+  for (const size_t i : served) {
+    num_ctx_rows = CheckedAdd(num_ctx_rows, feeds[i].aux_row_count, "DFlash 2 context rows");
+  }
+
+  PackedLayout layout;
+  const size_t reserved_rows =
+      CheckedAdd(num_ctx_rows, num_block_rows, "DFlash 2 packed rows");
+  CheckedMetadataValue(reserved_rows, "DFlash 2 packed rows");
+  layout.q_row_map.reserve(reserved_rows);
+  layout.qkv_row_map.reserve(reserved_rows);
+  layout.block_row_index.reserve(num_block_rows);
+  layout.cumulative_sequence_lengths.reserve(served.size() + 1);
+  layout.past_sequence_lengths.reserve(served.size());
+
+  // Rows this step actually ingests, after a windowed drafter drops the ones its query block can
+  // never read.
+  std::vector<size_t> ingest_begin(feeds.size());
+  std::vector<size_t> ingest_count(feeds.size());
+  size_t ctx_row = 0;
+  size_t max_blocks = 0;
+  num_ctx_rows = 0;
+  for (const size_t i : served) {
+    const auto& feed = feeds[i];
+    auto& state = requests_[feed.request];
+    if (state.cached_positions != feed.first_position) {
+      throw std::logic_error(
+          "The DFlash 2 drafter's cached context is not contiguous with the target's step.");
+    }
+
+    size_t dropped = 0;
+    if (context_window_ != 0 && feed.aux_row_count > context_window_) {
+      dropped = feed.aux_row_count - context_window_;
+    }
+    ingest_begin[i] = CheckedAdd(feed.aux_row_begin, dropped, "DFlash 2 auxiliary row offset");
+    ingest_count[i] = feed.aux_row_count - dropped;
+    num_ctx_rows = CheckedAdd(num_ctx_rows, ingest_count[i], "DFlash 2 context rows");
+  }
+  CheckedMetadataValue(
+      CheckedAdd(num_ctx_rows, num_block_rows, "DFlash 2 packed rows"),
+      "DFlash 2 packed rows");
+
+  for (const size_t i : served) {
+    const auto& feed = feeds[i];
+    auto& state = requests_[feed.request];
+    const size_t first_position = CheckedAdd(
+        feed.first_position, feed.aux_row_count - ingest_count[i],
+        "DFlash 2 first position");
+
+    const size_t slot = block_slot_of_feed[i];
+    const bool has_block = slot < block_feed_indices.size();
+    const size_t block_rows = has_block ? block_size : 0;
+    const size_t query_len =
+        CheckedAdd(ingest_count[i], block_rows, "DFlash 2 query length");
+    if (query_len == 0) {
+      throw std::logic_error("A DFlash 2 feed carries neither context nor a query block.");
+    }
+    const size_t total_positions =
+        CheckedAdd(first_position, query_len, "DFlash 2 KV length");
+    EnsureBlocks(state, total_positions);
+    max_blocks = std::max(
+        max_blocks, (total_positions - 1) / paged_block_size_ + 1);
+
+    // Context rows borrow the block's first query row; their attention output is discarded.
+    const size_t first_block_row =
+        CheckedMultiply(slot, block_size, "DFlash 2 block row index");
+    const int32_t borrowed_q_row = has_block
+                                       ? CheckedMetadataValue(first_block_row, "DFlash 2 query row")
+                                       : 0;
+    for (size_t row = 0; row < ingest_count[i]; ++row) {
+      layout.q_row_map.push_back(borrowed_q_row);
+      layout.qkv_row_map.push_back(CheckedMetadataValue(
+          CheckedAdd(num_block_rows, CheckedAdd(ctx_row, row, "DFlash 2 context row"),
+                     "DFlash 2 QKV row"),
+          "DFlash 2 QKV row"));
+    }
+    for (size_t row = 0; row < block_rows; ++row) {
+      layout.block_row_index.push_back(
+          CheckedMetadataValue(layout.q_row_map.size(), "DFlash 2 packed row"));
+      const int32_t block_row = CheckedMetadataValue(
+          CheckedAdd(first_block_row, row, "DFlash 2 block row"), "DFlash 2 block row");
+      layout.q_row_map.push_back(block_row);
+      layout.qkv_row_map.push_back(block_row);
+    }
+    ctx_row = CheckedAdd(ctx_row, ingest_count[i], "DFlash 2 context row");
+
+    layout.cumulative_sequence_lengths.push_back(
+        CheckedMetadataValue(layout.q_row_map.size(), "DFlash 2 cumulative sequence length"));
+    layout.past_sequence_lengths.push_back(
+        CheckedMetadataValue(first_position, "DFlash 2 past sequence length"));
+    const int32_t query_length = CheckedMetadataValue(query_len, "DFlash 2 query length");
+    const int32_t kv_length = CheckedMetadataValue(total_positions, "DFlash 2 KV length");
+    layout.max_query_len = std::max(layout.max_query_len, query_length);
+    layout.max_kv_len = std::max(layout.max_kv_len, kv_length);
+    layout.min_kv_len = std::min(layout.min_kv_len, kv_length);
+  }
+
+  const size_t num_tokens = layout.q_row_map.size();
+  auto device = model_->p_device_inputs_;
+
+  auto fill_int32 = [](Tensor& tensor, const std::vector<int32_t>& values) {
+    auto span = tensor.GetDeviceSpan<int32_t>();
+    std::copy(values.begin(), values.end(), span.CpuSpan().begin());
+    span.CopyCpuToDevice();
+  };
+
+  auto& packed_aux = Dflash2StepTensor(step_tensors_.packed_aux, device, aux_type_,
+                                       {static_cast<int64_t>(num_ctx_rows),
+                                        static_cast<int64_t>(aux_hidden_size_)});
+  const size_t aux_row_bytes =
+      CheckedMultiply(aux_hidden_size_, Ort::SizeOf(aux_type_), "DFlash 2 auxiliary row bytes");
+  auto source_bytes = aux_hidden_states.GetByteSpan();
+  auto destination_bytes = packed_aux.GetByteSpan();
+  size_t destination_row = 0;
+  for (const size_t i : served) {
+    if (ingest_count[i] == 0) {
+      continue;
+    }
+    destination_bytes.subspan(destination_row * aux_row_bytes, ingest_count[i] * aux_row_bytes)
+        .CopyFrom(source_bytes.subspan(ingest_begin[i] * aux_row_bytes,
+                                       ingest_count[i] * aux_row_bytes));
+    destination_row += ingest_count[i];
+  }
+
+  auto& input_ids = Dflash2StepTensor(step_tensors_.input_ids, device, Ort::TypeToTensorType<int64_t>,
+                                      {static_cast<int64_t>(num_block_rows)});
+  {
+    auto span = input_ids.GetDeviceSpan<int64_t>();
+    auto cpu = span.CpuSpan();
+    for (size_t slot = 0; slot < block_feed_indices.size(); ++slot) {
+      const auto& feed = feeds[block_feed_indices[slot]];
+      cpu[slot * block_size] = feed.wants_drafts ? feed.anchor_token : config_.mask_token_id;
+      for (size_t row = 1; row < block_size; ++row) {
+        cpu[slot * block_size + row] = config_.mask_token_id;
+      }
+    }
+    span.CopyCpuToDevice();
+  }
+
+  constexpr auto int32_type = Ort::TypeToTensorType<int32_t>;
+  auto& q_row_map = Dflash2StepTensor(step_tensors_.q_row_map, device, int32_type,
+                                      {static_cast<int64_t>(num_tokens)});
+  fill_int32(q_row_map, layout.q_row_map);
+  auto& qkv_row_map = Dflash2StepTensor(step_tensors_.qkv_row_map, device, int32_type,
+                                        {static_cast<int64_t>(num_tokens)});
+  fill_int32(qkv_row_map, layout.qkv_row_map);
+  auto& block_row_index = Dflash2StepTensor(step_tensors_.block_row_index, device, int32_type,
+                                            {static_cast<int64_t>(num_block_rows)});
+  fill_int32(block_row_index, layout.block_row_index);
+  auto& cumulative = Dflash2StepTensor(step_tensors_.cumulative_sequence_lengths, device, int32_type,
+                                       {static_cast<int64_t>(served.size() + 1)});
+  fill_int32(cumulative, layout.cumulative_sequence_lengths);
+  auto& past_lengths = Dflash2StepTensor(step_tensors_.past_sequence_lengths, device, int32_type,
+                                         {static_cast<int64_t>(served.size())});
+  fill_int32(past_lengths, layout.past_sequence_lengths);
+
+  auto& block_table = Dflash2StepTensor(
+      step_tensors_.block_table, device, int32_type,
+      {static_cast<int64_t>(served.size()), static_cast<int64_t>(max_blocks)});
+  {
+    auto span = block_table.GetDeviceSpan<int32_t>();
+    auto cpu = span.CpuSpan();
+    for (size_t row = 0; row < served.size(); ++row) {
+      const auto& blocks = requests_[feeds[served[row]].request].blocks;
+      auto columns = cpu.subspan(row * max_blocks, max_blocks);
+      if (ring_blocks_ == 0) {
+        const size_t used = std::min(blocks.size(), max_blocks);
+        std::copy_n(blocks.begin(), used, columns.begin());
+        std::fill(columns.begin() + used, columns.end(), int32_t{-1});
+        continue;
+      }
+      // A windowed drafter repeats its ring across every column: column j holds the block that
+      // owns position j * block_size, which is ring[j % ring_blocks]. Every column is written, so
+      // the reused buffer never exposes a stale id.
+      for (size_t column = 0; column < max_blocks; ++column) {
+        columns[column] = blocks[column % blocks.size()];
+      }
+    }
+    span.CopyCpuToDevice();
+  }
+
+  auto& metadata = Dflash2StepTensor(step_tensors_.attention_metadata, GetDeviceInterface(DeviceType::CPU),
+                                     int32_type, {3});
+  {
+    auto span = metadata.GetDeviceSpan<int32_t>();
+    auto cpu = span.CpuSpan();
+    cpu[0] = layout.max_query_len;
+    cpu[1] = layout.max_kv_len;
+    cpu[2] = layout.min_kv_len;
+  }
+
+  const size_t batch = block_feed_indices.size();
+  auto& candidate_ids = Dflash2StepTensor(step_tensors_.candidate_ids, device, int32_type,
+                                          {static_cast<int64_t>(batch), static_cast<int64_t>(num_spec),
+                                           static_cast<int64_t>(top_k)});
+  auto& scores = Dflash2StepTensor(step_tensors_.scores, device, Ort::TypeToTensorType<float>,
+                                   {static_cast<int64_t>(batch), static_cast<int64_t>(num_spec),
+                                    static_cast<int64_t>(top_k), static_cast<int64_t>(top_k)});
+
+  std::vector<const char*> input_names{
+      config_.inputs.aux_hidden_states.c_str(), config_.inputs.input_ids.c_str(),
+      config_.inputs.q_row_map.c_str(), config_.inputs.qkv_row_map.c_str(),
+      config_.inputs.block_row_index.c_str(), config_.inputs.cumulative_sequence_lengths.c_str(),
+      config_.inputs.past_sequence_lengths.c_str(), config_.inputs.block_table.c_str(),
+      config_.inputs.attention_metadata.c_str()};
+  std::vector<OrtValue*> inputs{packed_aux.GetOrtTensor(), input_ids.GetOrtTensor(),
+                                q_row_map.GetOrtTensor(), qkv_row_map.GetOrtTensor(),
+                                block_row_index.GetOrtTensor(), cumulative.GetOrtTensor(),
+                                past_lengths.GetOrtTensor(), block_table.GetOrtTensor(),
+                                metadata.GetOrtTensor()};
+  std::vector<const char*> output_names{config_.outputs.candidate_ids.c_str(),
+                                        config_.outputs.scores.c_str()};
+  std::vector<OrtValue*> outputs{candidate_ids.GetOrtTensor(), scores.GetOrtTensor()};
+  for (size_t i = 0; i < caches_.size(); ++i) {
+    input_names.push_back(cache_input_names_[i].c_str());
+    inputs.push_back(caches_[i]->GetOrtTensor());
+    output_names.push_back(cache_output_names_[i].c_str());
+    outputs.push_back(caches_[i]->GetOrtTensor());
+  }
+
+  model_->session_->Run(run_options_.get(), input_names.data(), inputs.data(), input_names.size(),
+                        output_names.data(), outputs.data(), output_names.size());
+
+  for (const size_t i : served) {
+    const auto& feed = feeds[i];
+    requests_[feed.request].cached_positions = CheckedAdd(
+        feed.first_position, feed.aux_row_count, "DFlash 2 cached positions");
+  }
+
+  if (!drafts_wanted) {
+    return true;
+  }
+
+  // The spans own the host mirrors these point into, so they must outlive the reads below.
+  auto candidate_span = candidate_ids.GetDeviceSpan<int32_t>();
+  auto scores_span = scores.GetDeviceSpan<float>();
+  auto candidate_cpu = candidate_span.CopyDeviceToCpu();
+  auto scores_cpu = scores_span.CopyDeviceToCpu();
+  for (size_t slot = 0; slot < block_feed_indices.size(); ++slot) {
+    // Greedy walk of the lattice: slot l's chosen candidate index selects the row of slot l+1's
+    // score matrix, so the drafted block is one coherent path rather than seven independent argmaxes.
+    auto& out = drafts[block_feed_indices[slot]];
+    out.reserve(num_spec);
+    size_t previous = 0;
+    for (size_t step = 0; step < num_spec; ++step) {
+      const float* row = scores_cpu.data() + ((slot * num_spec + step) * top_k + previous) * top_k;
+      const size_t best = static_cast<size_t>(std::max_element(row, row + top_k) - row);
+      out.push_back(candidate_cpu[(slot * num_spec + step) * top_k + best]);
+      previous = best;
+    }
+  }
+  return true;
+}
+
+}  // namespace Generators
+
+===== FILE: test\cpp\engine\paged_key_value_cache_tests.cpp =====
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+#include <array>
+#include <limits>
+
+#include <gtest/gtest.h>
+
+#include "engine/cache_manager.h"
+#include "engine/engine_invariants.h"
+#include "engine/paged_key_value_cache.h"
+#include "engine_test_doubles.h"
+#include "engine_test_helpers.h"
+#include "models/model_state_manifest.h"
+
+namespace Generators {
+namespace test {
+namespace {
+
+std::unique_ptr<PagedKeyValueCache> MakePagedCache(const std::shared_ptr<Model>& model) {
+  return std::make_unique<PagedKeyValueCache>(model);
+}
+
+class PagedKeyValueCacheTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    model_ = LoadDummyDecoderModel();
+    Config::Engine::DynamicBatching dynamic_batching;
+    dynamic_batching.block_size = 4;
+    dynamic_batching.num_blocks = 3;
+    dynamic_batching.max_batch_size = 2;
+    model_->config_->engine.dynamic_batching = dynamic_batching;
+    assign_target_ =
+        MakeDoublesEngine(model_, /*capacity=*/2, EosToken(*model_)).engine;
+    cache_ = MakePagedCache(model_);
+  }
+
+  std::shared_ptr<Request> AddCommittedRequest(
+      std::array<int32_t, 4> prompt) {
+    auto request =
+        CreateRequestWithPrompt(assign_target_, prompt);
+    cache_->Add(request);
+    cache_->AppendTokens(request);
+    return request;
+  }
+
+  static RequestStepPlan PlanEntry(
+      const std::shared_ptr<Request>& request,
+      size_t target_cache_slots,
+      bool newly_admitted = false,
+      size_t whole_sequence_cache_slots = 0) {
+    RequestStepPlan entry;
+    entry.request = request;
+    entry.request_id = request.get();
+    entry.target_cache_slots = target_cache_slots;
+    entry.whole_sequence_cache_slots = whole_sequence_cache_slots;
+    entry.newly_admitted = newly_admitted;
+    return entry;
+  }
+
+  std::shared_ptr<Model> model_;
+  std::shared_ptr<Engine> assign_target_;
+  std::unique_ptr<PagedKeyValueCache> cache_;
+};
+
+TEST_F(PagedKeyValueCacheTest, DeferredActiveRequestRunsAfterCapacityIsReleased) {
+  auto first = AddCommittedRequest({2, 3, 4, 5});
+  auto second = AddCommittedRequest({6, 7, 8, 9});
+
+  StepPlan plan;
+  plan.requests.push_back(PlanEntry(first, 5));
+  plan.requests.push_back(PlanEntry(second, 5));
+
+  const auto result = cache_->PlanStepResources(plan);
+
+  ASSERT_TRUE(result.executable);
+  EXPECT_TRUE(result.capacity_deferred);
+  EXPECT_EQ(result.unserviceable_request_id, nullptr);
+  ASSERT_EQ(plan.requests.size(), 1u);
+  EXPECT_EQ(plan.requests[0].request, first);
+
+  const std::array reservation_requests{
+      PagedCacheReservationRequest{first.get(), 5, false},
+  };
+  auto reservation = cache_->Reserve(reservation_requests);
+  EXPECT_TRUE(
+      ValidateCacheInvariants(cache_->Snapshot(reservation)).empty());
+
+  reservation.Commit();
+  const auto snapshot = cache_->Snapshot();
+  EXPECT_TRUE(ValidateCacheInvariants(snapshot).empty());
+  ASSERT_EQ(snapshot.requests.size(), 2u);
+  EXPECT_EQ(snapshot.requests[0].request_id, first.get());
+  EXPECT_EQ(snapshot.requests[0].used_slots, 5u);
+  EXPECT_EQ(snapshot.requests[0].block_ids.size(), 2u);
+  EXPECT_EQ(snapshot.requests[1].request_id, second.get());
+  EXPECT_EQ(snapshot.requests[1].used_slots, 4u);
+  EXPECT_EQ(snapshot.requests[1].block_ids.size(), 1u);
+
+  cache_->Remove(first);
+  StepPlan next_plan;
+  next_plan.requests.push_back(PlanEntry(second, 5));
+
+  const auto next_result = cache_->PlanStepResources(next_plan);
+
+  ASSERT_TRUE(next_result.executable);
+  EXPECT_FALSE(next_result.capacity_deferred);
+  EXPECT_EQ(next_result.unserviceable_request_id, nullptr);
+  ASSERT_EQ(next_plan.requests.size(), 1u);
+  EXPECT_EQ(next_plan.requests[0].request, second);
+
+  const std::array next_reservation_requests{
+      PagedCacheReservationRequest{second.get(), 5, false},
+  };
+  auto next_reservation = cache_->Reserve(next_reservation_requests);
+  next_reservation.Commit();
+
+  const auto next_snapshot = cache_->Snapshot();
+  EXPECT_TRUE(ValidateCacheInvariants(next_snapshot).empty());
+  ASSERT_EQ(next_snapshot.requests.size(), 1u);
+  EXPECT_EQ(next_snapshot.requests[0].request_id, second.get());
+  EXPECT_EQ(next_snapshot.requests[0].used_slots, 5u);
+  EXPECT_EQ(next_snapshot.requests[0].block_ids.size(), 2u);
+}
+
+TEST_F(PagedKeyValueCacheTest, ReportsCommittedBoundaryForResident) {
+  auto request = AddCommittedRequest({2, 3, 4, 5});
+
+  EXPECT_EQ(cache_->CommittedSlots(request.get()), 4u);
+  EXPECT_THROW(cache_->CommittedSlots(this), StepPlanningConsistencyError);
+}
+
+TEST_F(PagedKeyValueCacheTest, DeferredActiveRequestsStillConsumeAdmissionCapacity) {
+  auto unserviceable = AddCommittedRequest({2, 3, 4, 5});
+  auto fitting = AddCommittedRequest({6, 7, 8, 9});
+  auto pending = CreateRequestWithPrompt(
+      assign_target_, std::array<int32_t, 1>{10});
+
+  StepPlan plan;
+  plan.requests.push_back(PlanEntry(unserviceable, 13));
+  plan.requests.push_back(PlanEntry(fitting, 4));
+  plan.requests.push_back(PlanEntry(pending, 1, true));
+
+  const auto result = cache_->PlanStepResources(plan);
+
+  ASSERT_TRUE(result.executable);
+  EXPECT_TRUE(result.capacity_deferred);
+  EXPECT_EQ(result.unserviceable_request_id, unserviceable.get());
+  ASSERT_EQ(plan.requests.size(), 1u);
+  EXPECT_EQ(plan.requests[0].request, fitting);
+  EXPECT_FALSE(plan.requests[0].newly_admitted);
+}
+
+// A chunked prefill asks for one chunk at a time, but admission has to be decided on the whole
+// prompt: the pool is three blocks of four slots, so a prompt of thirteen slots can never fit even
+// though its first chunk would.
+TEST_F(PagedKeyValueCacheTest, PromptTooLargeForThePoolIsUnserviceableEvenWhenItsChunkFits) {
+  auto pending = CreateRequestWithPrompt(
+      assign_target_, std::array<int32_t, 1>{10});
+
+  StepPlan plan;
+  plan.requests.push_back(PlanEntry(pending, /*target_cache_slots=*/1, /*newly_admitted=*/true,
+                                    /*whole_sequence_cache_slots=*/13));
+
+  const auto result = cache_->PlanStepResources(plan);
+
+  EXPECT_FALSE(result.executable);
+  EXPECT_EQ(result.unserviceable_request_id, pending.get());
+  EXPECT_TRUE(plan.requests.empty());
+}
+
+// Admission also has to wait for enough free blocks to hold the whole prompt, so a request never
+// starts a chunked prefill it cannot finish.
+TEST_F(PagedKeyValueCacheTest, AdmissionWaitsUntilTheWholePromptFits) {
+  auto committed = AddCommittedRequest({2, 3, 4, 5});
+  auto pending = CreateRequestWithPrompt(
+      assign_target_, std::array<int32_t, 1>{10});
+
+  StepPlan plan;
+  plan.requests.push_back(PlanEntry(committed, /*target_cache_slots=*/4));
+  // One block is already taken, leaving two of the three: the chunk needs one, the prompt needs
+  // three.
+  plan.requests.push_back(PlanEntry(pending, /*target_cache_slots=*/1, /*newly_admitted=*/true,
+                                    /*whole_sequence_cache_slots=*/9));
+
+  const auto result = cache_->PlanStepResources(plan);
+
+  ASSERT_TRUE(result.executable);
+  EXPECT_TRUE(result.capacity_deferred);
+  EXPECT_EQ(result.unserviceable_request_id, nullptr);
+  ASSERT_EQ(plan.requests.size(), 1u);
+  EXPECT_EQ(plan.requests[0].request, committed);
+}
+
+TEST_F(PagedKeyValueCacheTest, OmittedResidentKeepsItsCommittedBlockTable) {
+  auto omitted = AddCommittedRequest({2, 3, 4, 5});
+  auto scheduled = AddCommittedRequest({6, 7, 8, 9});
+  const auto before = cache_->Snapshot();
+
+  StepPlan plan;
+  plan.requests.push_back(PlanEntry(scheduled, 5));
+
+  const auto result = cache_->PlanStepResources(plan);
+
+  ASSERT_TRUE(result.executable);
+  ASSERT_EQ(plan.requests.size(), 1u);
+  const std::array reservation_requests{
+      PagedCacheReservationRequest{scheduled.get(), 5, false},
+  };
+  auto reservation = cache_->Reserve(reservation_requests);
+  reservation.Commit();
+
+  const auto after = cache_->Snapshot();
+  ASSERT_EQ(before.requests.size(), 2u);
+  ASSERT_EQ(after.requests.size(), 2u);
+  EXPECT_EQ(after.requests[0].request_id, omitted.get());
+  EXPECT_EQ(after.requests[0].block_ids, before.requests[0].block_ids);
+  EXPECT_EQ(after.requests[0].used_slots, before.requests[0].used_slots);
+  EXPECT_EQ(after.requests[1].request_id, scheduled.get());
+  EXPECT_EQ(after.requests[1].used_slots, 5u);
+}
+
+TEST_F(PagedKeyValueCacheTest, OmittedResidentsStillLimitNewAdmissions) {
+  auto first = AddCommittedRequest({2, 3, 4, 5});
+  auto second = AddCommittedRequest({6, 7, 8, 9});
+  auto pending = CreateRequestWithPrompt(
+      assign_target_, std::array<int32_t, 1>{10});
+
+  StepPlan plan;
+  plan.requests.push_back(PlanEntry(pending, 1, true, 1));
+
+  const auto result = cache_->PlanStepResources(plan);
+
+  EXPECT_FALSE(result.executable);
+  EXPECT_TRUE(result.capacity_deferred);
+  EXPECT_EQ(result.outcome.kind, StepOutcomeKind::CapacityDeferred);
+  EXPECT_TRUE(plan.requests.empty());
+}
+
+TEST_F(PagedKeyValueCacheTest, BlockedPrefillDoesNotPreventLaterAdmission) {
+  auto resident = AddCommittedRequest({2, 3, 4, 5});
+  auto blocked = CreateRequestWithPrompt(
+      assign_target_, std::array<int32_t, 1>{10});
+  auto fitting = CreateRequestWithPrompt(
+      assign_target_, std::array<int32_t, 1>{11});
+
+  StepPlan plan;
+  plan.requests.push_back(PlanEntry(resident, 4));
+  plan.requests.push_back(PlanEntry(blocked, 1, true, 9));
+  plan.requests.push_back(PlanEntry(fitting, 1, true, 4));
+
+  const auto result = cache_->PlanStepResources(plan);
+
+  ASSERT_TRUE(result.executable);
+  EXPECT_TRUE(result.capacity_deferred);
+  ASSERT_EQ(plan.requests.size(), 2u);
+  EXPECT_EQ(plan.requests[0].request, resident);
+  EXPECT_EQ(plan.requests[1].request, fitting);
+}
+
+TEST_F(PagedKeyValueCacheTest, InterleavedAdmissionAndResidentSubsetAreSelectedByIdentity) {
+  model_->config_->engine.dynamic_batching->max_batch_size = 3;
+  cache_ = MakePagedCache(model_);
+
+  auto omitted = AddCommittedRequest({2, 3, 4, 5});
+  auto resident = AddCommittedRequest({6, 7, 8, 9});
+  auto pending = CreateRequestWithPrompt(
+      assign_target_, std::array<int32_t, 1>{10});
+
+  StepPlan plan;
+  plan.requests.push_back(PlanEntry(pending, 1, true, 1));
+  plan.requests.push_back(PlanEntry(resident, 4));
+
+  const auto result = cache_->PlanStepResources(plan);
+
+  ASSERT_TRUE(result.executable);
+  EXPECT_FALSE(result.capacity_deferred);
+  ASSERT_EQ(plan.requests.size(), 2u);
+  EXPECT_EQ(plan.requests[0].request, pending);
+  EXPECT_TRUE(plan.requests[0].newly_admitted);
+  EXPECT_EQ(plan.requests[1].request, resident);
+  EXPECT_FALSE(plan.requests[1].newly_admitted);
+
+  const auto snapshot = cache_->Snapshot();
+  ASSERT_EQ(snapshot.requests.size(), 2u);
+  EXPECT_EQ(snapshot.requests[0].request_id, omitted.get());
+  EXPECT_EQ(snapshot.requests[0].used_slots, 4u);
+}
+
+TEST_F(PagedKeyValueCacheTest, GlobalOnlyPrefillChunkReservesWholePrompt) {
+  auto pending = CreateRequestWithPrompt(
+      assign_target_, std::array<int32_t, 9>{2, 3, 4, 5, 6, 7, 8, 9, 10});
+
+  StepPlan plan;
+  plan.requests.push_back(
+      PlanEntry(pending, /*target_cache_slots=*/3,
+                /*newly_admitted=*/true,
+                /*whole_sequence_cache_slots=*/9));
+
+  const auto result = cache_->PlanStepResources(plan);
+
+  ASSERT_TRUE(result.executable);
+  const std::array reservation_requests{
+      PagedCacheReservationRequest{pending.get(), 3, true, 9},
+  };
+  auto reservation = cache_->Reserve(reservation_requests);
+  EXPECT_EQ(reservation.ReservedBlockCount(), 3u);
+}
+
+TEST(PagedKeyValueCacheManifestTest, AllocatesOnlySparseLogicalLayersUsingDecoderBindings) {
+  auto model = LoadSyntheticPagedModel();
+  ASSERT_TRUE(model->config_->model.decoder.state_groups.has_value());
+  ASSERT_EQ(model->config_->model.decoder.state_groups->size(), 1u);
+  EXPECT_EQ(model->config_->model.decoder.state_groups->front().layer_ids,
+            std::vector<int>({1, 4}));
+
+  auto cache = MakePagedCache(model);
+
+  const auto values = cache->Cache();
+  const auto input_names = cache->Names();
+  const auto output_names = cache->OutputNames();
+
+  ASSERT_EQ(values.size(), 2u);
+  ASSERT_EQ(input_names.size(), 2u);
+  ASSERT_EQ(output_names.size(), 2u);
+  EXPECT_STREQ(input_names[0].first, "past_key_values.1.key");
+  EXPECT_STREQ(input_names[0].second, "past_key_values.1.value");
+  EXPECT_STREQ(output_names[0].first, "present.1.key");
+  EXPECT_STREQ(output_names[0].second, "present.1.value");
+  EXPECT_STREQ(input_names[1].first, "past_key_values.4.key");
+  EXPECT_STREQ(input_names[1].second, "past_key_values.4.value");
+  EXPECT_STREQ(output_names[1].first, "present.4.key");
+  EXPECT_STREQ(output_names[1].second, "present.4.value");
+  EXPECT_EQ(
+      values[0].first->GetTensorTypeAndShapeInfo()->GetElementType(),
+      ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+}
+
+TEST(PagedKeyValueCacheManifestTest, DenseLegacyManifestRetainsSequentialBindings) {
+  auto model = LoadDummyDecoderModel();
+  model->config_->engine.dynamic_batching = Config::Engine::DynamicBatching{};
+  model->config_->engine.dynamic_batching->block_size = 4;
+  model->config_->engine.dynamic_batching->num_blocks = 3;
+  ASSERT_FALSE(model->config_->model.decoder.state_groups.has_value());
+
+  auto cache = MakePagedCache(model);
+  const auto input_names = cache->Names();
+  const auto output_names = cache->OutputNames();
+
+  ASSERT_EQ(input_names.size(), 1u);
+  ASSERT_EQ(output_names.size(), 1u);
+  EXPECT_STREQ(input_names[0].first, "past_key_values.0.key");
+  EXPECT_STREQ(input_names[0].second, "past_key_values.0.value");
+  EXPECT_STREQ(output_names[0].first, "present.0.key");
+  EXPECT_STREQ(output_names[0].second, "present.0.value");
+  EXPECT_EQ(
+      cache->Cache()[0].first->GetTensorTypeAndShapeInfo()->GetElementType(),
+      ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+}
+
+TEST(PagedKeyValueCacheManifestTest, CacheManagerConstructsFromSparseManifest) {
+  auto manager = CacheManager::Create(LoadSyntheticPagedModel());
+
+  EXPECT_TRUE(manager->SupportsDynamicBatching());
+  EXPECT_EQ(manager->Snapshot().total_blocks, 128u);
+}
+
+TEST(PagedKeyValueCacheManifestTest, BlockCapacityUsesParticipatingLayerCount) {
+  EXPECT_EQ(
+      ComputePagedBlockCapacity(
+          /*available_memory_bytes=*/10240,
+          /*gpu_utilization_factor=*/1.0f,
+          /*reserved_memory_bytes=*/0,
+          /*block_size=*/4,
+          /*num_key_value_heads=*/1,
+          /*head_size=*/2,
+          /*full_layer_count=*/2,
+          /*element_size=*/2),
+      144u);
+  EXPECT_EQ(
+      ComputePagedBlockCapacity(
+          /*available_memory_bytes=*/10240,
+          /*gpu_utilization_factor=*/1.0f,
+          /*reserved_memory_bytes=*/0,
+          /*block_size=*/4,
+          /*num_key_value_heads=*/1,
+          /*head_size=*/2,
+          /*full_layer_count=*/6,
+          /*element_size=*/2),
+      48u);
+
+  // One auxiliary layer with the same geometry adds 32 bytes to the primary model's 64 bytes per
+  // block, so both pools together fit 96 blocks in the same 90%-adjusted memory budget.
+  EXPECT_EQ(
+      ComputePagedBlockCapacity(
+          /*available_memory_bytes=*/10240,
+          /*gpu_utilization_factor=*/1.0f,
+          /*reserved_memory_bytes=*/0,
+          /*block_size=*/4,
+          /*num_key_value_heads=*/1,
+          /*head_size=*/2,
+          /*full_layer_count=*/2,
+          /*element_size=*/2,
+          /*auxiliary_bytes_per_block=*/32),
+      96u);
+
+  EXPECT_EQ(
+      ComputePagedBlockCapacity(
+          /*available_memory_bytes=*/10240,
+          /*gpu_utilization_factor=*/1.0f,
+          /*reserved_memory_bytes=*/1024,
+          /*block_size=*/4,
+          /*num_key_value_heads=*/1,
+          /*head_size=*/2,
+          /*full_layer_count=*/2,
+          /*element_size=*/2),
+      128u);
+
+  EXPECT_THROW(
+      ComputePagedBlockCapacity(
+          /*available_memory_bytes=*/10240,
+          /*gpu_utilization_factor=*/1.0f,
+          /*reserved_memory_bytes=*/9216,
+          /*block_size=*/4,
+          /*num_key_value_heads=*/1,
+          /*head_size=*/2,
+          /*full_layer_count=*/2,
+          /*element_size=*/2),
+      std::runtime_error);
+
+  EXPECT_THROW(
+      ComputePagedBlockCapacity(
+          /*available_memory_bytes=*/10240,
+          /*gpu_utilization_factor=*/1.0f,
+          /*reserved_memory_bytes=*/0,
+          /*block_size=*/std::numeric_limits<size_t>::max(),
+          /*num_key_value_heads=*/2,
+          /*head_size=*/1,
+          /*full_layer_count=*/1,
+          /*element_size=*/1),
+      std::overflow_error);
+
+  EXPECT_THROW(
+      ComputePagedBlockCapacity(
+          /*available_memory_bytes=*/10240,
+          /*gpu_utilization_factor=*/1.0f,
+          /*reserved_memory_bytes=*/0,
+          /*block_size=*/4,
+          /*num_key_value_heads=*/1,
+          /*head_size=*/2,
+          /*full_layer_count=*/2,
+          /*element_size=*/2,
+          /*auxiliary_bytes_per_block=*/std::numeric_limits<size_t>::max()),
+      std::overflow_error);
+}
+
+TEST(PagedKeyValueCacheManifestTest, ExplicitBlockCountCoversBothPools) {
+  // Without a head, an explicit num_blocks is used verbatim.
+  EXPECT_EQ(
+      ResolveConfiguredPagedBlockCount(
+          /*configured_num_blocks=*/100,
+          /*primary_bytes_per_block=*/64,
+          /*auxiliary_bytes_per_block=*/0),
+      100u);
+
+  // num_blocks is the combined budget: 100 blocks of 64 bytes is 6400 bytes, which holds 66 blocks
+  // of the 96 bytes one target block plus one head block cost together.
+  EXPECT_EQ(
+      ResolveConfiguredPagedBlockCount(
+          /*configured_num_blocks=*/100,
+          /*primary_bytes_per_block=*/64,
+          /*auxiliary_bytes_per_block=*/32),
+      66u);
+
+  // DSpark also reserves fixed spill blocks for each active query. Deduct those bytes from the
+  // configured budget before splitting the remainder between target and drafter blocks.
+  EXPECT_EQ(
+      ResolveConfiguredPagedBlockCoun
+[End of the bounded source excerpt; the final file may be truncated.]
+
+TASK: This is a standalone offline response. No tools or tool results are available. Do not emit tool calls or execute anything; use only the supplied source. Improve cache-capacity diagnostics for windowed speculative decoding. A user configures engine.dynamic_batching.num_blocks and assumes it is the literal number of target blocks available, but the windowed drafter consumes a separate byte reservation. When a long request cannot fit, the user needs an actionable explanation of required target blocks, available target blocks, and drafter reservation, rather than a generic capacity error. Trace the existing accounting, preserve its target-equivalent budget semantics and rounding/overflow guards, and propose a minimal change that improves the failure or diagnostic surface. Include regression coverage for a request just below and just above capacity and for a drafter ring with guard space. Do not change attention context or silently admit an oversized request.
+
+Give a diagnosis grounded in the supplied code, a minimal unified diff with repository-relative paths, and focused regression-test additions. Explain limitations if the excerpt is insufficient. Do not reproduce entire files or repeat the source snapshot. Finish naturally when the issue response is complete.
