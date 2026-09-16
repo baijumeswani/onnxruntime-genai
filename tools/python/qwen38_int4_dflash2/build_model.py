@@ -712,7 +712,7 @@ def main() -> None:
     )
 
     target_model, shared_initializers, head_attributes = transform_target(
-        target_model_path, reference_model_path, aux_layers
+        target_model_path, reference_model_path, AUX_LAYERS
     )
     onnx.save_model(target_model, str(output / "model.onnx"))
 
