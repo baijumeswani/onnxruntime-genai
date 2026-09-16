@@ -12,6 +12,8 @@ import onnx
 from onnx import numpy_helper
 
 FPA_INTB_CONFIG_KEY = "ep.cuda.fpa_intb_gemm"
+DRAFTER_TARGET_LAYERS = (5, 19, 33, 47, 61)
+AUX_HIDDEN_STATE_LAYERS = tuple(layer + 1 for layer in DRAFTER_TARGET_LAYERS)
 
 
 def validate_external_data(model: onnx.ModelProto, model_dir: Path) -> bool:
@@ -51,7 +53,7 @@ def validate_model_directory(model_dir: Path) -> None:
         raise RuntimeError("DFlash2 sliding_window must be 2048.")
     if drafter.get("selector_top_k") != 16:
         raise RuntimeError("DFlash2 selector_top_k must be 16.")
-    if tuple(drafter.get("aux_hidden_state_layers", ())) != (5, 19, 33, 47, 61):
+    if tuple(drafter.get("aux_hidden_state_layers", ())) != AUX_HIDDEN_STATE_LAYERS:
         raise RuntimeError("DFlash2 auxiliary hidden-state layers are unexpected.")
 
     target = onnx.load(str(model_dir / "model.onnx"), load_external_data=False)

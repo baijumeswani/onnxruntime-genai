@@ -19,6 +19,9 @@ the ONNX Runtime GenAI continuous-batching Engine with the CUDA EP.
 Its decoder session configuration enables the ORT fpA/intB path with
 `ep.cuda.fpa_intb_gemm=1`; no `ORT_FPA_INTB_GEMM` environment variable is
 required.
+The DFlash2 checkpoint targets layers `[5,19,33,47,61]`; the generated target
+and configuration expose their output residuals as incoming-layer taps
+`[6,20,34,48,62]`.
 
 Generated drafter structure:
 

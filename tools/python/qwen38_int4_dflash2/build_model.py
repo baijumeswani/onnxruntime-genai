@@ -32,7 +32,8 @@ except ImportError:
     MatMulNBitsQuantizer = None
 
 LAYER_COUNT = 64
-AUX_LAYERS = (5, 19, 33, 47, 61)
+DRAFTER_TARGET_LAYERS = (5, 19, 33, 47, 61)
+AUX_LAYERS = tuple(layer + 1 for layer in DRAFTER_TARGET_LAYERS)
 STATE_UPDATE_CAPACITY = 7
 DRAFT_WIDTH = 7
 DRAFTER_SLIDING_WINDOW = 2048
@@ -530,6 +531,7 @@ def update_config(
 
     drafter = copy.deepcopy(dflash2_config["model"]["dflash2"])
     drafter["filename"] = "dflash2-int4.onnx"
+    drafter["aux_hidden_state_layers"] = list(AUX_LAYERS)
     drafter["shared_initializers"] = [
         external_initializer_config(shared_initializers[name], "model.onnx.data")
         for name in SHARED_INITIALIZER_NAMES
@@ -616,6 +618,8 @@ def write_manifest(
             "selector_top_k": DRAFTER_SELECTOR_TOP_K,
             "state_update_capacity": STATE_UPDATE_CAPACITY,
             "fpa_intb_session_config": {FPA_INTB_CONFIG_KEY: "1"},
+            "drafter_target_layers": list(DRAFTER_TARGET_LAYERS),
+            "aux_hidden_state_layers": list(AUX_LAYERS),
         },
         "artifacts": artifacts,
     }
@@ -677,11 +681,11 @@ def main() -> None:
                 f"The source DFlash2 package has {key}={actual}; "
                 f"this retained pipeline requires {expected}."
             )
-    aux_layers = tuple(drafter_config.get("aux_hidden_state_layers", ()))
-    if aux_layers != AUX_LAYERS:
+    source_aux_layers = tuple(drafter_config.get("aux_hidden_state_layers", ()))
+    if source_aux_layers != DRAFTER_TARGET_LAYERS:
         raise RuntimeError(
-            "The source DFlash2 auxiliary layers do not match the retained "
-            f"configuration: {aux_layers} != {AUX_LAYERS}."
+            "The source DFlash2 package does not identify the expected target "
+            f"layer outputs: {source_aux_layers} != {DRAFTER_TARGET_LAYERS}."
         )
     target_model_path = target / target_config["model"]["decoder"]["filename"]
     reference_model_path = dflash2 / dflash2_config["model"]["decoder"]["filename"]

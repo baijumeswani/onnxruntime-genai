@@ -161,10 +161,14 @@ draft width.
 DFlash2 consumes hidden states from target layers:
 
 ```text
-5, 19, 33, 47, 61
+6, 20, 34, 48, 62
 ```
 
-The corresponding layer-normalized tensors are concatenated into:
+The checkpoint's `target_layer_ids` are `5,19,33,47,61`. SpecForge consumes
+each targeted layer's output, which is the residual stream entering the next
+layer. The exported `aux_hidden_state_layers` and graph taps must therefore be
+each checkpoint layer plus one. The corresponding layer-normalized tensors are
+concatenated into:
 
 ```text
 aux_hidden_states
