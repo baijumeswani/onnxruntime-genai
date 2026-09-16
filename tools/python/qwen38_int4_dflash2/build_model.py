@@ -39,6 +39,14 @@ DRAFT_WIDTH = 7
 DRAFTER_SLIDING_WINDOW = 2048
 DRAFTER_SELECTOR_TOP_K = 16
 FPA_INTB_CONFIG_KEY = "ep.cuda.fpa_intb_gemm"
+DEVICE_INITIALIZER_CONFIG_KEY = "session.use_device_allocator_for_initializers"
+SPECIAL_TOKEN_FIELDS = (
+    "eos_token_id",
+    "bot_token_id",
+    "eot_token_id",
+    "bor_token_id",
+    "eor_token_id",
+)
 SHARED_INITIALIZER_NAMES = (
     "model.embed_tokens.weight",
     "lm_head.MatMul.weight_Q4",
@@ -509,8 +517,13 @@ def update_config(
     shared_initializers: dict[str, object],
 ) -> dict:
     config = copy.deepcopy(target_config)
+    for field in SPECIAL_TOKEN_FIELDS:
+        if field not in dflash2_config["model"]:
+            raise RuntimeError(f"The source DFlash2 package is missing model.{field}.")
+        config["model"][field] = copy.deepcopy(dflash2_config["model"][field])
     decoder = config["model"]["decoder"]
     decoder.setdefault("session_options", {})[FPA_INTB_CONFIG_KEY] = "1"
+    decoder["session_options"][DEVICE_INITIALIZER_CONFIG_KEY] = "1"
     decoder["filename"] = "model.onnx"
     decoder["inputs"]["state_update_capture_count"] = "state_update_capture_count"
     decoder["inputs"]["state_update_active"] = "state_update_active"
@@ -520,6 +533,10 @@ def update_config(
     ] = "state_update.%d.recurrent_capsule"
     decoder["outputs"]["aux_hidden_states"] = "aux_hidden_states"
     decoder["state_update_capacity"] = STATE_UPDATE_CAPACITY
+    decoder["shared_initializers"] = [
+        external_initializer_config(shared_initializers[name], "model.onnx.data")
+        for name in SHARED_INITIALIZER_NAMES
+    ]
     for group in decoder["state_groups"]:
         if group["kind"] == "fixed_conv":
             group["state_update"] = {"capacity": STATE_UPDATE_CAPACITY}
@@ -618,6 +635,9 @@ def write_manifest(
             "selector_top_k": DRAFTER_SELECTOR_TOP_K,
             "state_update_capacity": STATE_UPDATE_CAPACITY,
             "fpa_intb_session_config": {FPA_INTB_CONFIG_KEY: "1"},
+            "device_initializer_session_config": {
+                DEVICE_INITIALIZER_CONFIG_KEY: "1"
+            },
             "drafter_target_layers": list(DRAFTER_TARGET_LAYERS),
             "aux_hidden_state_layers": list(AUX_LAYERS),
         },

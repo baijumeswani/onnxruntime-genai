@@ -227,6 +227,18 @@ selects runtime fpA/intB packing and dispatch for eligible `MatMulNBits`
 nodes. It does not enable offline weight prepacking or a persistent tactic
 cache.
 
+The generated decoder also enables
+`session.use_device_allocator_for_initializers=1`, and both decoder and
+DFlash2 configuration sections identify the same target-authoritative dense
+embedding and quantized LM-head ranges.
+
+### 8. Refresh Qwen special-token metadata
+
+The older base INT4 target package has only a scalar EOS ID. The DFlash2 source
+package uses the same tokenizer and carries the complete Qwen control-token
+metadata. The builder copies its EOS list and BOT/EOT/BOR/EOR IDs into the
+output so request boundaries and reasoning blocks use the current schema.
+
 ## Drafter graph changes
 
 ### 1. Share the target embedding and vocabulary head

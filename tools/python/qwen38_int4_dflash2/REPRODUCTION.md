@@ -22,6 +22,10 @@ required.
 The DFlash2 checkpoint targets layers `[5,19,33,47,61]`; the generated target
 and configuration expose their output residuals as incoming-layer taps
 `[6,20,34,48,62]`.
+The output also refreshes the complete Qwen special-token metadata from the
+DFlash2 package, enables the device allocator for initializers, and declares
+the same target-authoritative embedding and quantized LM-head ranges in both
+the decoder and DFlash2 configuration sections.
 
 Generated drafter structure:
 

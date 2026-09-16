@@ -12,8 +12,16 @@ import onnx
 from onnx import numpy_helper
 
 FPA_INTB_CONFIG_KEY = "ep.cuda.fpa_intb_gemm"
+DEVICE_INITIALIZER_CONFIG_KEY = "session.use_device_allocator_for_initializers"
 DRAFTER_TARGET_LAYERS = (5, 19, 33, 47, 61)
 AUX_HIDDEN_STATE_LAYERS = tuple(layer + 1 for layer in DRAFTER_TARGET_LAYERS)
+EXPECTED_SPECIAL_TOKENS = {
+    "eos_token_id": [248046, 248044],
+    "bot_token_id": 248058,
+    "eot_token_id": 248059,
+    "bor_token_id": 248068,
+    "eor_token_id": 248069,
+}
 
 
 def validate_external_data(model: onnx.ModelProto, model_dir: Path) -> bool:
@@ -39,10 +47,20 @@ def validate_model_directory(model_dir: Path) -> None:
     config = json.loads((model_dir / "genai_config.json").read_text(encoding="utf-8"))
     decoder = config["model"]["decoder"]
     drafter = config["model"]["dflash2"]
+    for field, expected in EXPECTED_SPECIAL_TOKENS.items():
+        if config["model"].get(field) != expected:
+            raise RuntimeError(f"model.{field} must be {expected!r}.")
     if decoder["filename"] != "model.onnx":
         raise RuntimeError("Decoder must use model.onnx.")
     if decoder.get("session_options", {}).get(FPA_INTB_CONFIG_KEY) != "1":
         raise RuntimeError(f"Decoder session_options must set {FPA_INTB_CONFIG_KEY}=1.")
+    if (
+        decoder.get("session_options", {}).get(DEVICE_INITIALIZER_CONFIG_KEY)
+        != "1"
+    ):
+        raise RuntimeError(
+            f"Decoder session_options must set {DEVICE_INITIALIZER_CONFIG_KEY}=1."
+        )
     if drafter["filename"] != "dflash2-int4.onnx":
         raise RuntimeError("DFlash2 must use dflash2-int4.onnx.")
     if decoder.get("state_update_capacity") != 7:
@@ -188,7 +206,12 @@ def validate_model_directory(model_dir: Path) -> None:
     if [node.name for node in dynamic_matmuls] != ["/dflash2/selector/pair"]:
         raise RuntimeError("DFlash2 must retain only the dynamic selector MatMul.")
 
+    target_shared = decoder.get("shared_initializers", [])
     shared = drafter.get("shared_initializers", [])
+    target_shared_by_name = {
+        initializer["name"]: initializer for initializer in target_shared
+    }
+    shared_by_name = {initializer["name"]: initializer for initializer in shared}
     shared_names = {initializer["name"] for initializer in shared}
     expected_shared = {
         "model.embed_tokens.weight",
@@ -197,6 +220,13 @@ def validate_model_directory(model_dir: Path) -> None:
     }
     if shared_names != expected_shared:
         raise RuntimeError("DFlash2 shared initializer metadata is incomplete.")
+    if set(target_shared_by_name) != expected_shared:
+        raise RuntimeError("Target shared initializer metadata is incomplete.")
+    for name in expected_shared:
+        if target_shared_by_name[name] != shared_by_name[name]:
+            raise RuntimeError(
+                f"Target and DFlash2 shared initializer metadata differs for {name}."
+            )
     for initializer in drafter_graph.graph.initializer:
         if initializer.name not in expected_shared:
             continue
