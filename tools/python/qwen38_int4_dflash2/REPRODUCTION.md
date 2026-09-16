@@ -16,6 +16,9 @@ the exact `matmul_nbits_quantizer.py` implementation used for each build.
 
 The generated model passed `validate_model.py` and loaded successfully through
 the ONNX Runtime GenAI continuous-batching Engine with the CUDA EP.
+Its decoder session configuration enables the ORT fpA/intB path with
+`ep.cuda.fpa_intb_gemm=1`; no `ORT_FPA_INTB_GEMM` environment variable is
+required.
 
 Generated drafter structure:
 

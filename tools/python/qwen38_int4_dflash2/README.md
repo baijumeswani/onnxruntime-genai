@@ -209,6 +209,20 @@ The decoder configuration gains:
 - Fixed convolution and recurrent state-update metadata.
 - `key_head_count: 16` for recurrent groups.
 
+### 7. Enable the ORT fpA/intB path per session
+
+The decoder `session_options` set:
+
+```json
+"ep.cuda.fpa_intb_gemm": "1"
+```
+
+This is the session-scoped equivalent of `ORT_FPA_INTB_GEMM=1`, so the
+generated model does not depend on a process-wide environment variable. It
+selects runtime fpA/intB packing and dispatch for eligible `MatMulNBits`
+nodes. It does not enable offline weight prepacking or a persistent tactic
+cache.
+
 ## Drafter graph changes
 
 ### 1. Share the target embedding and vocabulary head

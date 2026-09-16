@@ -11,6 +11,8 @@ from pathlib import Path
 import onnx
 from onnx import numpy_helper
 
+FPA_INTB_CONFIG_KEY = "ep.cuda.fpa_intb_gemm"
+
 
 def validate_external_data(model: onnx.ModelProto, model_dir: Path) -> bool:
     external_files = set()
@@ -37,6 +39,8 @@ def validate_model_directory(model_dir: Path) -> None:
     drafter = config["model"]["dflash2"]
     if decoder["filename"] != "model.onnx":
         raise RuntimeError("Decoder must use model.onnx.")
+    if decoder.get("session_options", {}).get(FPA_INTB_CONFIG_KEY) != "1":
+        raise RuntimeError(f"Decoder session_options must set {FPA_INTB_CONFIG_KEY}=1.")
     if drafter["filename"] != "dflash2-int4.onnx":
         raise RuntimeError("DFlash2 must use dflash2-int4.onnx.")
     if decoder.get("state_update_capacity") != 7:

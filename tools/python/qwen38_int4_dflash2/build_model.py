@@ -37,6 +37,7 @@ STATE_UPDATE_CAPACITY = 7
 DRAFT_WIDTH = 7
 DRAFTER_SLIDING_WINDOW = 2048
 DRAFTER_SELECTOR_TOP_K = 16
+FPA_INTB_CONFIG_KEY = "ep.cuda.fpa_intb_gemm"
 SHARED_INITIALIZER_NAMES = (
     "model.embed_tokens.weight",
     "lm_head.MatMul.weight_Q4",
@@ -508,6 +509,7 @@ def update_config(
 ) -> dict:
     config = copy.deepcopy(target_config)
     decoder = config["model"]["decoder"]
+    decoder.setdefault("session_options", {})[FPA_INTB_CONFIG_KEY] = "1"
     decoder["filename"] = "model.onnx"
     decoder["inputs"]["state_update_capture_count"] = "state_update_capture_count"
     decoder["inputs"]["state_update_active"] = "state_update_active"
@@ -613,6 +615,7 @@ def write_manifest(
             "sliding_window": DRAFTER_SLIDING_WINDOW,
             "selector_top_k": DRAFTER_SELECTOR_TOP_K,
             "state_update_capacity": STATE_UPDATE_CAPACITY,
+            "fpa_intb_session_config": {FPA_INTB_CONFIG_KEY: "1"},
         },
         "artifacts": artifacts,
     }
