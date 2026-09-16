@@ -9,13 +9,16 @@ The builder was exercised from a clean worktree using:
 - Retained ORT quantization:
   symmetric INT4, block size 32
 - Qualified conversion environment:
-  Python 3.13.15, ONNX 1.22.0, NumPy 2.4.2, and ONNX Runtime 1.30.0
+  Python 3.13.15, ONNX 1.22.0, NumPy 2.5.3, and ONNX Runtime 1.30.0
 
 `MODEL_BUILD_MANIFEST.json` records these versions and the SHA-256 digest of
 the exact `matmul_nbits_quantizer.py` implementation used for each build.
 
 The generated model passed `validate_model.py` and loaded successfully through
 the ONNX Runtime GenAI continuous-batching Engine with the CUDA EP.
+The reproduction was repeated after rebasing the tooling branch onto upstream
+commit `d5b40851`. A current-API 4K smoke turn generated all 16 requested tokens
+with DFlash2 active.
 Its decoder session configuration enables the ORT fpA/intB path with
 `ep.cuda.fpa_intb_gemm=1`; no `ORT_FPA_INTB_GEMM` environment variable is
 required.
