@@ -236,11 +236,22 @@ Quality gate:
 
 Investigate a hierarchical/candidate LM head:
 
-1. Produce a small candidate set from a cheap draft head or vocabulary clusters.
-2. Compute exact logits for candidates.
-3. Fall back to the full head when the winner cannot be certified.
+1. Cluster vocabulary rows offline and store each centroid plus a residual-norm
+   bound.
+2. Score centroids, then compute exact logits only for rows in candidate
+   clusters.
+3. Certify the winner with an upper bound such as
+   `q dot c + norm(q) * max_residual`; fall back to the full head whenever an
+   unvisited cluster can still win.
 
 This has higher implementation complexity but can preserve exact greedy output while avoiding most of the 200,064-column projection on easy tokens.
+
+TensorRT-LLM's Gemma4 implementation provides a concrete centroid-shortlist
+precedent, although it is not a generic exact implementation. Treat it as a
+design reference rather than directly reusable MAI support.
+
+Source:
+[TensorRT-LLM Gemma4 centroid shortlist](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/models/modeling_gemma4.py)
 
 ## Priority 3: reduce long-context KV traffic
 
@@ -287,7 +298,40 @@ aggregate, but each GQA/KV-head partition and split-K reduction may still
 underfill this small GPU. Sweep multi-block thresholds rather than copying
 large-GPU XQA heuristics.
 
-Source: [TensorRT-LLM GPT attention](https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.html)
+The current ORT XQA implementation already supports an `XQA_NB_SUB_SEQ`
+environment override. Its automatic rule is:
+
+```text
+min(max(1, SM_count / (batch_size * KV_heads)), ceil(max_seq_len / 256))
+```
+
+For batch one, eight KV heads, and the working 48-SM estimate, the automatic
+choice is six subsequences at long context. Benchmark `2, 4, 6, 8, 12` at
+32K/64K/128K before changing code. Six produces exactly 48 primary CTAs; eight
+or twelve may improve tail balance or memory-level parallelism at the cost of
+more scratch reduction.
+
+Sources:
+
+- [TensorRT-LLM GPT attention](https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.html)
+- `onnxruntime\contrib_ops\cuda\bert\xqa\mha_impl.cuh`
+
+### 5. Query-aware sparse reads for the seven global layers
+
+The 35 local layers are already bounded to 512 tokens, so any sparse-attention
+prototype should target only the seven global layers. Use the existing
+128-token page table as the selection unit:
+
+1. Record per-page attention mass and retrieval accuracy on 64K/128K coding
+   traces.
+2. Build a cheap query-to-page score using page summaries.
+3. Run exact attention over selected pages plus recent and sink pages.
+4. Fall back to all pages when a confidence or error bound is not met.
+
+This is a high-risk, quality-gated path, but it is the highest-ceiling
+non-speculative way to reduce 128K traffic. Stop if preserving the retrieval
+gate requires more than 8K retained tokens per global layer or if page
+selection plus fallback costs erase a 20% attention gain.
 
 ## Priority 4: exact speculative decoding
 
@@ -302,9 +346,26 @@ Implement an n-gram drafter over the existing prompt and generated suffix:
 - Code commonly repeats identifiers, syntax, indentation, imports, and nearby text.
 - Long contexts provide a large candidate corpus.
 
-Test n-grams 3-8 and draft counts 2, 4, 8, and 16. Track accepted tokens per target pass, target verify latency, and net tok/s.
+The current GenAI implementation already supplies the required pieces:
+
+- `NGramLookup` with incremental exact history indexing and chained lookup.
+- `Engine.max_draft_tokens_per_proposal()`.
+- `Request.set_draft_tokens(...)`.
+- Device-side verification and accepted-prefix commit in the Engine.
+
+Automatic n-gram proposing is limited to the regular `Generator`, but
+caller-supplied Engine proposals are available to continuous batching. The
+current engine-wide maximum is seven drafts, constrained by recurrent-state
+checkpoint capacity, so test n-grams `3, 4, 5`, draft counts `2, 4, 7`, and
+chained lookup on/off. Track lookup coverage, evaluated and accepted drafts,
+mean committed tokens per target pass, verification latency, and net tok/s.
 
 At 128K, the current 13.4 tok/s baseline needs about 3.7 accepted output tokens per baseline-equivalent target cost to exceed 50 tok/s. Prompt lookup is the lowest-risk way to test whether the workload provides that acceptance.
+
+If fixed-order n-grams have useful coverage but short continuations, add a
+suffix-automaton proposer over the same committed history. It remains
+model-free and target-verified while finding variable-length repeated
+substrings.
 
 ### 2. External draft model
 
@@ -419,6 +480,16 @@ Sources:
 - [NVFP4](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/)
 - [CUDA asynchronous copies and TMA](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/async-copies.html)
 
+For decode, benchmark the top QMoE FC1/FC2 shapes against the available
+SM120/SM121 FlashInfer and CUTLASS paths before starting a new kernel. Public
+TensorRT-LLM code uses FlashInfer for SM121 MoE decode and CUTLASS above a
+prefill-row threshold, while some FP8 grouped-GEMM paths remain disabled on
+SM120/SM121 pending validation. This makes validation and end-to-end evidence
+more important than assuming datacenter Blackwell results transfer to GB10.
+
+Source:
+[TensorRT-LLM SM12x fused MoE](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/moe/fused_moe/fused_moe_cute_dsl_b12x.py)
+
 ## Priority 7: model loading and residency
 
 The graph references approximately:
@@ -459,13 +530,15 @@ Source: [CUDA L2 cache control](https://docs.nvidia.com/cuda/cuda-programming-gu
 | Phase | Work | Stop/advance criterion |
 |---|---|---|
 | A | Finish FP16 XQA H128 | Advance if parity passes and attention improves >=15% |
-| B | Fuse Q/K norm into PagedAttention; fuse residual+norm | Exact parity and >=0.5 ms/token combined |
-| C | Quantize LM head W8/W4 | Coding gate passes; target >50 tok/s at 4K |
-| D | Calibrate FP8 and per-channel INT8 global KV | Quality gate passes; >=1.4x attention speedup |
-| E | Prompt-lookup speculative decoding | >=2 accepted drafts average and positive net gain |
-| F | CUDA W4/QMoE kernel tuning | >=5% end-to-end gain per accepted change |
-| G | Async graph/token pipeline | Correct event/cancel/EOS semantics and >=3% gain |
-| H | Prefill chunk/QMoE tuning | Lower TTFT without decode or memory regression |
+| B | Sweep `XQA_NB_SUB_SEQ` at 32K-128K | Keep only >=5% 64K gain with stable numerics |
+| C | Engine prompt lookup, widths 2/4/7 | >=2 committed tokens per target pass and positive net gain |
+| D | Fuse Q/K norm into PagedAttention; fuse residual+norm | Exact parity and >=0.5 ms/token combined |
+| E | Quantize LM head W8/W4 | Coding gate passes; target >50 tok/s at 4K |
+| F | Calibrate FP8 and per-channel INT8 global KV | Quality gate passes; >=1.4x attention speedup |
+| G | CUDA W4/QMoE kernel tuning | >=5% end-to-end gain per accepted change |
+| H | Async graph/token pipeline | Correct event/cancel/EOS semantics and >=3% gain |
+| I | Prefill chunk/QMoE tuning | Lower TTFT without decode or memory regression |
+| J | Global-layer page selection | >=20% attention gain with retrieval gate passing |
 
 ## Expected target path
 
